@@ -1,9 +1,18 @@
 import gstools as gs
 import numpy as np
+from scipy.ndimage import label
 
 
-def sample_field(dim: int = 2, vf: float = 0.5, shape: int = 128, size: float = 30.0,
-                 len_scale: float = 1.0, anis: float = 1.0, mode_no: int = 36, random_state: int = 1) -> np.ndarray:
+def sample_field(
+        dim: int = 2,
+        vf: float = 0.5,
+        shape: int = 128,
+        size: float = 30.0,
+        len_scale: float = 1.0,
+        anis: float = 1.0,
+        mode_no: int = 36,
+        random_state: int = 1
+) -> np.ndarray:
 
     kernel = gs.covmodel.Exponential(
         dim=dim,
@@ -36,11 +45,14 @@ def sample_field(dim: int = 2, vf: float = 0.5, shape: int = 128, size: float = 
     )
 
     field = srf(pos, mesh_type="structured", post_process=False)
-
     thresh = np.quantile(field, vf)
     field = np.where(field <= thresh, 0, 1)
-
     return field.astype(np.uint8)
+
+
+def label_inclusions(field, target_value: int = 0):
+    field_labelled, n = label(field == target_value)
+    return np.array(field_labelled).astype(np.uint8)
 
 
 def load_field(filepath: str) -> np.ndarray:
