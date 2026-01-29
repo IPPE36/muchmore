@@ -8,7 +8,7 @@ from shapely.affinity import translate
 from skimage.measure import find_contours
 
 
-def periodic_contours(field, min_area=5, snap_tol=0) -> List[Polygon]:
+def periodic_contours(field, min_area=5, snap_tol=0.15) -> List[Polygon]:
     """
     Tile microstructure to consider inclusions outside and ensure consistent polygons for periodic meshing
     """
