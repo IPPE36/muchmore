@@ -3,7 +3,7 @@ import numpy as np
 from scipy.ndimage import label
 
 
-def sample_field(
+def sample_field_srf(
         dim: int = 2,
         vf: float = 0.5,
         shape: int = 128,
@@ -50,8 +50,8 @@ def sample_field(
     return field.astype(np.uint8)
 
 
-def label_inclusions(field, target_value: int = 0):
-    field_labelled, n = label(field == target_value)
+def label_field(field: np.ndarray, value: int = 0) -> np.ndarray:
+    field_labelled, n = label(field == value)
     return np.array(field_labelled).astype(np.uint8)
 
 
@@ -59,7 +59,7 @@ def load_field(filepath: str) -> np.ndarray:
     return np.load(filepath).astype(np.uint8)
 
 
-def store_field(field: np.ndarray, filepath: str) -> None:
+def dump_field(field: np.ndarray, filepath: str) -> None:
     np.save(filepath, field.astype(np.uint8))
 
 

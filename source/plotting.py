@@ -1,7 +1,8 @@
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+from shapely.geometry import Polygon
+from typing import List
 
 matplotlib.use("agg")
 
@@ -26,68 +27,25 @@ def plot_contours(field, contours, filepath: str) -> None:
     return None
 
 
-def plot_2d_mesh(field, verts, faces, filepath, *, threshold=0.5) -> None:
-    """
-    Plot a 2D triangular mesh colored by phase (0/1),
-    where phase is determined from the field at triangle centroids.
-    """
-    assert field.ndim == 2
-
-    # --- determine phase per triangle
-    c = verts[faces].mean(axis=1)           # centroids (x,y)
-    x = np.clip(np.rint(c[:, 0]).astype(int), 0, field.shape[1] - 1)
-    y = np.clip(np.rint(c[:, 1]).astype(int), 0, field.shape[0] - 1)
-    face_phase = (field[y, x] >= threshold).astype(int)
-
+def plot_polygons(field: np.ndarray, polys: List[Polygon], filepath: str) -> None:
     fig, ax = plt.subplots(figsize=(6, 6))
+    tiled = np.tile(field, (3, 3))
+    plt.imshow(tiled, origin="lower", aspect="equal")
 
-    # background (optional)
-    ax.imshow(field, origin="lower", aspect="equal", alpha=0.25)
+    ny, nx = field.shape
+    x0, x1 = nx, 2 * nx
+    y0, y1 = ny, 2 * ny
+    plt.plot([x0, x0, x1, x1, x0], [y0, y1, y1, y0, y0], color="red", lw=2.5, ls=":")
 
-    # colored mesh
-    tpc = ax.tripcolor(
-        verts[:, 0],
-        verts[:, 1],
-        faces,
-        facecolors=face_phase,
-        shading="flat",
-        cmap="tab10",
-        edgecolors="k",
-        linewidth=0.2,
-    )
+    # Plot polygons
+    for i, poly in enumerate(polys):
+        if poly.is_empty:
+            continue
+        x, y = poly.exterior.xy
+        ax.fill(x, y, alpha=0.5, edgecolor="k")
 
-    ax.axis("off")
-    plt.tight_layout()
-    plt.savefig(filepath, dpi=300)
-    plt.close(fig)
-
-
-def plot_surface(verts, faces, values=None, filepath: str = None) -> None:
-
-    fig = plt.figure(figsize=(6, 6))
-    ax = fig.add_subplot(111, projection="3d")
-    mesh = Poly3DCollection(verts[faces], alpha=0.9)
-
-    if values is not None:
-        face_values = values[faces].mean(axis=1)
-        mesh.set_array(face_values)
-        mesh.set_cmap("viridis")
-        mesh.set_edgecolor("none")
-        fig.colorbar(mesh, ax=ax, shrink=0.6, label="field value")
-    else:
-        mesh.set_facecolor("lightgray")
-        mesh.set_edgecolor("none")
-
-    ax.add_collection3d(mesh)
-
-    # Set equal aspect ratio
-    min_xyz = verts.min(axis=0)
-    max_xyz = verts.max(axis=0)
-    ax.set_xlim(min_xyz[0], max_xyz[0])
-    ax.set_ylim(min_xyz[1], max_xyz[1])
-    ax.set_zlim(min_xyz[2], max_xyz[2])
-    ax.set_box_aspect(max_xyz - min_xyz)
-    plt.tight_layout()
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
     plt.savefig(filepath, dpi=300)
     return None
 
