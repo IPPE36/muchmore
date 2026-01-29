@@ -1,6 +1,6 @@
 import numpy as np
 from source.field import dump_field, load_field, label_field
-from source.mesh_2D import mesh_microstructure_2d
+from source.mesh_2D import mesh_2d
 
 
 class Microstructure:
@@ -12,7 +12,7 @@ class Microstructure:
         self.vf = np.count_nonzero(field == 1) / field.size
 
     def mesh_2d(self):
-        mesh_microstructure_2d(self.field, lc=0.01)
+        mesh_2d(self.field)
 
     def dump(self, filepath: str):
         dump_field(self.field, filepath)
