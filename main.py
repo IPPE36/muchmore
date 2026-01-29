@@ -1,10 +1,11 @@
-from source.field import sample_field_srf
+from source.field import sample_field_srf, sample_field_grf
 from source.microstructure import Microstructure
 from source.plotting import plot_field
 
 
 if __name__ == "__main__":
-    X = sample_field_srf(dim=2, shape=128)
-    # plot_field(X, "field.png")
+    X = sample_field_grf(dim=3, shape=64, anis=1)
+    # plot_field(X, "test.png")
+    # X = sample_field_srf(dim=3, shape=128)
     ms = Microstructure(X)
-    ms.mesh_2d()
+    ms.mesh()

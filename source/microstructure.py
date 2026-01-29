@@ -1,6 +1,7 @@
 import numpy as np
 from source.field import dump_field, load_field, label_field
 from source.mesh_2D import mesh_2d
+from source.mesh_3D import mesh_3d
 
 
 class Microstructure:
@@ -11,8 +12,13 @@ class Microstructure:
         self.size = size
         self.vf = np.count_nonzero(field == 1) / field.size
 
-    def mesh_2d(self):
-        mesh_2d(self.field)
+    def mesh(self):
+        if self.ndim == 2:
+            mesh_2d(self.field)
+        elif self.ndim == 3:
+            mesh_3d(self.field)
+        else:
+            raise NotImplementedError
 
     def dump(self, filepath: str):
         dump_field(self.field, filepath)

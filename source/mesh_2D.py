@@ -7,10 +7,11 @@ from shapely.ops import unary_union, snap
 from shapely.affinity import translate
 from skimage.measure import find_contours
 
-from source.plotting import plot_polygons, plot_contours
-
 
 def periodic_contours(field, min_area=5, snap_tol=0) -> List[Polygon]:
+    """
+    Tile microstructure to consider inclusions outside and ensure consistent polygons for periodic meshing
+    """
 
     tiled = np.tile(field, (3, 3))
     contours = find_contours(tiled, level=0.5)
@@ -65,7 +66,7 @@ def polygon_to_loop(gmsh_model, poly: Polygon):
     Returns curveLoopTag.
     """
     pts = list(poly.exterior.coords)
-    pts = pts[:-1]  # remove last point because shapely repeats start at end
+    pts = pts[:-1]
 
     p_tags = []
     for x, y in pts:
@@ -85,14 +86,12 @@ def polygon_to_loop(gmsh_model, poly: Polygon):
 
 def mesh_2d(field: np.ndarray):
 
-    polys_center = periodic_contours(field)
+    polygons = periodic_contours(field)
     ny, nx = field.shape
 
     # Shift polygons into origin tile
     polys = []
-    for poly in polys_center:
-        if poly.is_empty:
-            continue
+    for poly in polygons:
         p = translate(poly, xoff=-nx, yoff=-ny)
         p = p.simplify(0.5, preserve_topology=True)
         polys.append(p)
@@ -166,8 +165,9 @@ def mesh_2d(field: np.ndarray):
 
     # Mesh options (fast debug)
     gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
-    gmsh.option.setNumber("Mesh.CharacteristicLengthExtendFromBoundary", 0)
-    gmsh.option.setNumber("Mesh.Algorithm", 6)
+    gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 1)
+    gmsh.option.setNumber("Mesh.CharacteristicLengthFactor", 0.33)
+    gmsh.option.setNumber("Mesh.Algorithm", 5)
 
     # Generate mesh
     gmsh.model.mesh.generate(2)
