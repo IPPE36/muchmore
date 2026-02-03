@@ -1,71 +1,156 @@
-from __future__ import annotations
+import subprocess
+from pathlib import Path
+from typing import List, Literal
 
-from typing import List
-
+import gmsh
 import numpy as np
-from skimage.measure import marching_cubes
 import pyvista as pv
+from gmshModel.Model.GenericRVE import GenericRVE
+from scipy.ndimage import distance_transform_edt
+from skimage.measure import marching_cubes
+
+from source.timer import timer
+
+ROOT = Path(__file__).resolve().parents[1]
+FREECAD_WORKER = str(ROOT / "source" / "freecad_utils.py")
+FREECAD_PYTHON = r"C:\Program Files\FreeCAD 1.0\bin\python.exe"
 
 
-def periodic_iso_surfaces(field, min_area=5, snap_tol=0) -> List[pv.PolyData]:
+def stl_to_step(stl_path: str, step_path: str, nx: int, ny: int, nz: int, verbose: bool = False):
+    p = subprocess.run(
+        [FREECAD_PYTHON, FREECAD_WORKER, stl_path, step_path, str(nx), str(ny), str(nz)],
+        text=True,
+        capture_output=True
+    )
+    if verbose:
+        print("returncode:", p.returncode)
+        print("STDOUT:\n", p.stdout)
+        print("STDERR:\n", p.stderr)
+    return step_path
 
-    tiled = np.tile(field, (3, 3, 3))
 
-    # extract iso-surface on tiled domain
-    verts_zyx, faces, _, _ = marching_cubes(tiled.astype(np.float32), level=0.5)
-    # marching_cubes outputs vertices in (z, y, x) index coordinates by default
-    # reorder to (x, y, z) to match your 2D pixel-space convention
-    verts_xyz = verts_zyx[:, [2, 1, 0]].astype(np.float64)
+def clean_pv(poly: pv.PolyData, tol: float = 1e-6) -> pv.PolyData:
+    poly = poly.triangulate()
+    poly = poly.clean(tolerance=tol)
+    poly = poly.compute_normals(auto_orient_normals=True, consistent_normals=True)
+    return poly
 
-    # PyVista mesh, face format: [3, i0, i1, i2, 3, j0, j1, j2, ...]
-    faces_pv = np.hstack([np.full((faces.shape[0], 1), 3, dtype=np.int64), faces]).ravel()
+
+def split_parts(poly: pv.PolyData):
+    out = poly.connectivity(extraction_mode="all")
+
+    # Newer PyVista: MultiBlock
+    if isinstance(out, pv.MultiBlock):
+        return [p for p in out if p is not None and p.n_cells > 0]
+
+    # Older PyVista: PolyData with RegionId
+    rid_name = "RegionId" if "RegionId" in out.array_names else out.array_names[-1]
+    regions = np.unique(out[rid_name])
+
+    parts = []
+    for r in regions:
+        part = out.threshold([r, r], scalars=rid_name).extract_geometry()
+        if part.n_cells:
+            parts.append(part)
+    return parts
+
+
+def periodic_iso_surfaces(field, min_area: float = 50.0) -> List[pv.PolyData]:
+
+    # --- tile field ---
+    tiled = np.tile(field, (3, 3, 3)).astype(np.float32)
+    nx, ny, nz = field.shape
+    x, y, z = np.indices(tiled.shape)
+
+    # --- zero out outer region ---
+    tiled[
+        (x < nx * 0.85) | (x > nx * 2.15) |
+        (y < ny * 0.85) | (y > ny * 2.15) |
+        (z < nz * 0.85) | (z > nz * 2.15)
+    ] = 0.0
+
+    # --- signed distance field ---
+    mask = tiled > 0.5
+    phi = distance_transform_edt(mask) - distance_transform_edt(~mask)
+
+    # --- marching cubes ---
+    verts_zyx, faces, _, _ = marching_cubes(phi, level=0.0, step_size=2, allow_degenerate=False)
+    verts_xyz = verts_zyx[:, [2, 1, 0]]
+
+    faces_pv = np.c_[np.full(len(faces), 3), faces].astype(np.int64).ravel()
     surf = pv.PolyData(verts_xyz, faces_pv)
 
-    # central tile bounds in pixel space:
-    ny, nx, nz = field.shape
-    x0, x1 = nx, 2 * nx
-    y0, y1 = ny, 2 * ny
-    z0, z1 = nz, 2 * nz
-
-    # clip to axis-aligned box (robust triangle clipping via VTK)
-    clipped = surf.clip_box(bounds=(x0, x1, y0, y1, z0, z1), invert=False)
-    if clipped.n_cells == 0:
-        return []
-
-    # Optional snap: push vertices within snap_tol to exact box planes
-    if snap_tol and snap_tol > 0:
-        pts = clipped.points.copy()
-        # snap to x planes
-        pts[np.abs(pts[:, 0] - x0) <= snap_tol, 0] = x0
-        pts[np.abs(pts[:, 0] - x1) <= snap_tol, 0] = x1
-        # snap to y planes
-        pts[np.abs(pts[:, 1] - y0) <= snap_tol, 1] = y0
-        pts[np.abs(pts[:, 1] - y1) <= snap_tol, 1] = y1
-        # snap to z planes
-        pts[np.abs(pts[:, 2] - z0) <= snap_tol, 2] = z0
-        pts[np.abs(pts[:, 2] - z1) <= snap_tol, 2] = z1
-        clipped.points = pts
-
-        # Clean coincident points / degenerate triangles that snapping can introduce
-        clipped = clipped.clean(tolerance=0.0)
-
-    # Split into connected components and filter by surface area
-    comps = clipped.connectivity(extraction_mode="all")
-    out: List[pv.PolyData] = []
-    for i in range(comps.n_blocks):
-        block = comps[i]
-        if block is None or block.n_cells == 0:
-            continue
-        area = float(block.area)  # surface area
-        if area >= min_area:
-            out.append(block)
-
-    return out
+    # --- split into connected components ---
+    return [p for p in split_parts(surf) if float(p.area) >= min_area]
 
 
-def mesh_3d(field: np.ndarray):
-    polys_center = periodic_iso_surfaces(field)
-    return
+def mesh_3d(
+    field: np.ndarray,
+    algo: Literal["frontal", "delaunay", "hxt"] = "frontal",
+    element_order: Literal[1, 2] = 1,
+    lc: float = 0.3,
+    model_name: str = "new_rve",
+    show: bool = True,
+):
+    stl_path = str(ROOT / "temp" / f"{model_name}.stl")
+    step_path = str(ROOT / "temp" / f"{model_name}.step")
+
+    nx, ny, nz = field.shape
+    rve = GenericRVE(
+        size=[float(nx), float(ny), float(nz)],
+        origin=[0.0, 0.0, 0.0],
+        periodicityFlags=[1, 1, 1],
+    )
+    gmsh.model.add(model_name)
+    occ = gmsh.model.occ
+
+    algo_dict = {
+        "delaunay": 1,  # default
+        "frontal": 4,  # most robust/slower
+        "hxt": 10,  # hex dominated
+    }
+
+    algo = algo_dict[algo]
+    gmsh.option.setNumber("Mesh.CharacteristicLengthFromPoints", 1)
+    gmsh.option.setNumber("Mesh.CharacteristicLengthFromCurvature", 0)
+    gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
+    gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 1)
+    gmsh.option.setNumber("Mesh.ElementOrder", element_order)
+    gmsh.option.setNumber("Mesh.CharacteristicLengthFactor", lc)
+    gmsh.option.setNumber("Mesh.Algorithm3D", algo)
+    gmsh.option.setNumber("Mesh.OptimizeNetgen", 1)
+    gmsh.option.setNumber("Mesh.Optimize", 1)
+    gmsh.option.setNumber("Mesh.ColorCarousel", 1)
+    gmsh.option.setNumber("Mesh.Format", 39)  # = ABAQUS .inp
+    gmsh.option.setNumber("General.Verbosity", 0)
+
+    with timer("MARSHING CUBES"):
+        parts = periodic_iso_surfaces(field)
+        shift = np.array([nx, ny, nz], dtype=float)
+        parts = [clean_pv(p.translate(-shift, inplace=False)) for p in parts]
+        merged = pv.merge(parts)
+        merged.save(stl_path)
+
+    with timer("FREECAD STEP"):
+        stl_to_step(stl_path, step_path, nx, ny, nz)
+
+    with timer("GMSH SETUP"):
+        occ.importShapes(step_path)
+        occ.synchronize()
+        occ.removeAllDuplicates()
+        occ.synchronize()
+        rve.setupPeriodicity()
+
+    with timer("MESHING VOLUMES"):
+        gmsh.model.mesh.generate(3)
+
+    with timer("STORE RVE"):
+        gmsh.write(f"{model_name}.inp")
+
+    if show:
+        gmsh.fltk.run()
+
+    gmsh.finalize()
 
 
 if __name__ == "__main__":

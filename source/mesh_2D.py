@@ -1,19 +1,20 @@
-from typing import List
+from typing import List, Literal
 
 import gmsh
 import numpy as np
-from shapely.geometry import Polygon, box
-from shapely.ops import unary_union, snap
+from gmshModel.Model.GenericRVE import GenericRVE
 from shapely.affinity import translate
+from shapely.geometry import Polygon, box
+from shapely.ops import unary_union
 from skimage.measure import find_contours
 
 
-def periodic_contours(field, min_area=5, snap_tol=0.15) -> List[Polygon]:
+def periodic_contours(field, min_area=5) -> List[Polygon]:
     """
     Tile microstructure to consider inclusions outside and ensure consistent polygons for periodic meshing
     """
 
-    tiled = np.tile(field, (3, 3))
+    tiled = np.tile(field, (3, 3)).astype(np.float32)
     contours = find_contours(tiled, level=0.5)
 
     # central tile bounds in pixel space:
@@ -21,7 +22,6 @@ def periodic_contours(field, min_area=5, snap_tol=0.15) -> List[Polygon]:
     x0, x1 = nx, 2 * nx
     y0, y1 = ny, 2 * ny
     rve = box(x0, y0, x1, y1)
-    rve_bnd = rve.boundary
 
     polys = []
     for c in contours:
@@ -32,7 +32,6 @@ def periodic_contours(field, min_area=5, snap_tol=0.15) -> List[Polygon]:
         if (not poly.is_valid) or poly.area <= 0:
             continue
 
-        # fast reject: intersects (includes boundary) instead of area check
         if not poly.intersects(rve):
             continue
 
@@ -40,15 +39,8 @@ def periodic_contours(field, min_area=5, snap_tol=0.15) -> List[Polygon]:
         if clipped.is_empty:
             continue
 
-        # clean & snap to exact RVE edges
-        clipped = clipped.buffer(0)
-        clipped = snap(clipped, rve_bnd, snap_tol)
-
         if clipped.area >= min_area:
-            if clipped.geom_type == "Polygon":
-                polys.append(clipped)
-            elif clipped.geom_type == "MultiPolygon":
-                polys.extend(list(clipped.geoms))
+            polys.append(poly)
 
     if polys:
         merged = unary_union(polys).buffer(0)
@@ -60,18 +52,16 @@ def periodic_contours(field, min_area=5, snap_tol=0.15) -> List[Polygon]:
     return []
 
 
-def polygon_to_loop(gmsh_model, poly: Polygon):
+def polygon_to_loop(gmsh_model, poly: Polygon, lc=0.0):
     """
     Adds a shapely polygon to gmsh as a curve loop.
     Returns curveLoopTag.
     """
     pts = list(poly.exterior.coords)
     pts = pts[:-1]
-
     p_tags = []
     for x, y in pts:
-        p_tags.append(gmsh_model.occ.addPoint(float(x), float(y), 0.0))
-
+        p_tags.append(gmsh_model.occ.addPoint(float(x), float(y), lc))
     # create lines
     l_tags = []
     n = len(p_tags)
@@ -79,12 +69,18 @@ def polygon_to_loop(gmsh_model, poly: Polygon):
         a = p_tags[i]
         b = p_tags[(i + 1) % n]
         l_tags.append(gmsh_model.occ.addLine(a, b))
-
     loop = gmsh_model.occ.addCurveLoop(l_tags)
     return loop
 
 
-def mesh_2d(field: np.ndarray):
+def mesh_2d(
+    field: np.ndarray,
+    algo: Literal["frontal-delaunay", "delaunay"] = "frontal-delaunay",
+    element_order: Literal[1, 2] = 2,
+    lc: float = 0.3,
+    model_name: str = "new_rve",
+    show: bool = True,
+):
 
     polygons = periodic_contours(field)
     ny, nx = field.shape
@@ -97,11 +93,14 @@ def mesh_2d(field: np.ndarray):
         polys.append(p)
 
     gmsh.initialize()
-    gmsh.model.add("ms2d")
+    gmsh.model.add(model_name)
     occ = gmsh.model.occ
 
-    # RVE at origin
-    rect = occ.addRectangle(0, 0, 0, nx, ny)
+    rve = GenericRVE(
+        size=[float(nx), float(ny), 0.0],
+        origin=[0.0, 0.0, 0.0],
+        periodicityFlags=[1, 1, 0],
+    )
 
     # Inclusion surfaces (now also in origin coordinates)
     surfs = []
@@ -113,9 +112,24 @@ def mesh_2d(field: np.ndarray):
         surfs.append(surf)
     occ.synchronize()
 
-    # Boolean fragment (conforming interfaces)
-    outDimTags, outMap = occ.fragment([(2, rect)], [(2, s) for s in surfs])
+    # RVE at origin
+    rect = occ.addRectangle(0, 0, 0, nx, ny)
+
+    # Mutual fragmentation: every surface is fragmented against every other
+    objs = [(2, rect)] + [(2, s) for s in surfs]
+    outDimTags, outMap = occ.fragment(objs, [])
     occ.synchronize()
+
+    # Clip inclusions to the rve
+    rect = occ.addRectangle(0, 0, 0, nx, ny)
+    volumes = gmsh.model.occ.getEntities(dim=2)
+    out, _ = gmsh.model.occ.intersect(
+        volumes,
+        [(2, rect)],
+        removeObject=True,
+        removeTool=True
+    )
+    gmsh.model.occ.synchronize()
 
     matrix_surfs = sorted({tag for (dim, tag) in outMap[0] if dim == 2})
     inclusion_surfs = sorted({
@@ -125,56 +139,45 @@ def mesh_2d(field: np.ndarray):
         if dim == 2
     })
 
+    # --- Physical groups ---
     gmsh.model.addPhysicalGroup(2, inclusion_surfs, tag=1)
     gmsh.model.setPhysicalName(2, 1, "inclusions")
     gmsh.model.addPhysicalGroup(2, matrix_surfs, tag=2)
     gmsh.model.setPhysicalName(2, 2, "matrix")
 
-    # --- Periodic boundary constraints (origin tile) ---
-    eps = 1e-9
-    xL, xR = 0.0, float(nx)
-    yB, yT = 0.0, float(ny)
+    rve.setupPeriodicity()
 
-    left = gmsh.model.getEntitiesInBoundingBox(xL-eps, yB-eps, -eps, xL+eps, yT+eps,  eps, 1)
-    right = gmsh.model.getEntitiesInBoundingBox(xR-eps, yB-eps, -eps, xR+eps, yT+eps,  eps, 1)
-    bot = gmsh.model.getEntitiesInBoundingBox(xL-eps, yB-eps, -eps, xR+eps, yB+eps,  eps, 1)
-    top = gmsh.model.getEntitiesInBoundingBox(xL-eps, yT-eps, -eps, xR+eps, yT+eps,  eps, 1)
+    algo_dict = {
+        "delaunay": 5,  # default
+        "frontal-delaunay": 6,  # most robust, a little slower
+    }
+    algo = algo_dict[algo]
 
-    left_tags = [c[1] for c in left]
-    right_tags = [c[1] for c in right]
-    bot_tags = [c[1] for c in bot]
-    top_tags = [c[1] for c in top]
-
-    # Pair right -> left (translate by -nx)
-    gmsh.model.mesh.setPeriodic(
-        1, right_tags, left_tags,
-        [1, 0, 0, -nx,
-         0, 1, 0,  0,
-         0, 0, 1,  0,
-         0, 0, 0,  1]
-    )
-
-    # Pair top -> bottom (translate by -ny)
-    gmsh.model.mesh.setPeriodic(
-        1, top_tags, bot_tags,
-        [1, 0, 0,  0,
-         0, 1, 0, -ny,
-         0, 0, 1,  0,
-         0, 0, 0,  1]
-    )
-
-    # Mesh options (fast debug)
-    gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
+    # Mesh options
+    gmsh.option.setNumber("Mesh.CharacteristicLengthFromPoints", 1)
+    gmsh.option.setNumber("Mesh.CharacteristicLengthFromCurvature", 1)
+    gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 1)
     gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 1)
-    gmsh.option.setNumber("Mesh.CharacteristicLengthFactor", 0.33)
-    gmsh.option.setNumber("Mesh.Algorithm", 5)
+    gmsh.option.setNumber("Mesh.ElementOrder", element_order)
+    gmsh.option.setNumber("Mesh.CharacteristicLengthFactor", lc)
+    gmsh.option.setNumber("Mesh.Algorithm", algo)
+    gmsh.option.setNumber("Mesh.Optimize", 1)
+    gmsh.option.setNumber("Mesh.ColorCarousel", 1)
+    gmsh.option.setNumber("General.Verbosity", 5)
 
     # Generate mesh
-    gmsh.model.mesh.generate(2)
-    gmsh.write("ms2d.msh")
-    gmsh.fltk.run()  # interactive viewer
+    gmsh.model.mesh.generate(1)  # Curves
+    gmsh.model.mesh.generate(2)  # Surfaces
+
+    # Assign phases
+    gmsh.write(f"{model_name}.msh")
+
+    if show:
+        gmsh.fltk.run()
+
     gmsh.finalize()
 
 
 if __name__ == "__main__":
     exit()
+
