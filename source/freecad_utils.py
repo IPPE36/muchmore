@@ -8,12 +8,13 @@ import Part
 
 def stl_to_step(
     stl_path: str,
-    step_path: str,
+    a_path: str,
+    b_path: str,
     nx: float,
     ny: float,
     nz: float,
     tol: float = 1e-12,
-) -> str:
+) -> None:
 
     doc = App.ActiveDocument
     if doc is None:
@@ -41,7 +42,6 @@ def stl_to_step(
     solid = Part.makeSolid(shape)
     solid_obj = doc.addObject("Part::Feature", "Solid")
     solid_obj.Shape = solid
-
     doc.recompute()
 
     # ----------------------------
@@ -51,42 +51,42 @@ def stl_to_step(
     box = Part.makeBox(nx, ny, nz)
     box_obj = doc.addObject("Part::Feature", "RVE_Box")
     box_obj.Shape = box
-
     doc.recompute()
 
     # ----------------------------
-    # Boolean Cut: solid ∩ box
-    # (keep only the part inside RVE)
+    # Phase A: solid ∩ box
     # ----------------------------
-    cut_shape = solid_obj.Shape.common(box_obj.Shape)
-    # cut_shape = cut_shape.removeSplitter()
-
-    cut_obj = doc.addObject("Part::Feature", "RVE_Cut")
-    cut_obj.Shape = cut_shape
+    phaseA_shape = solid_obj.Shape.common(box_obj.Shape)
+    phaseA_obj = doc.addObject("Part::Feature", "Phase_A")
+    phaseA_obj.Shape = phaseA_shape
     doc.recompute()
 
     # ----------------------------
-    # Export to STEP
+    # Phase B: box \ Phase A
+    # (complement of A inside the RVE)
     # ----------------------------
-    Part.export([cut_obj], step_path)
+    phaseB_shape = box_obj.Shape.cut(phaseA_shape)
+    phaseB_obj = doc.addObject("Part::Feature", "Phase_B")
+    phaseB_obj.Shape = phaseB_shape
+    doc.recompute()
 
-    return step_path
+    # ----------------------------
+    # Export both to STEP
+    # ----------------------------
+    Part.export([phaseA_obj], a_path)
+    Part.export([phaseB_obj], b_path)
+
+    return None
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) < 3:
-        print("Usage: freecad_worker.py input.stl output.step [tol]", file=sys.stderr)
-        return 2
-
     stl_path = argv[1]
-    step_path = argv[2]
-    nx = float(argv[3])
-    ny = float(argv[4])
-    nz = float(argv[5])
-
-    stl_to_step(stl_path, step_path, nx, ny, nz)
-    print(f"OK: {step_path}")
-
+    a_path = argv[2]
+    b_path = argv[3]
+    nx = float(argv[4])
+    ny = float(argv[5])
+    nz = float(argv[6])
+    stl_to_step(stl_path, a_path, b_path, nx, ny, nz)
     return 0
 
 

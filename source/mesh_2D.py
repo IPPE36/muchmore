@@ -166,8 +166,7 @@ def mesh_2d(
     gmsh.option.setNumber("General.Verbosity", 5)
 
     # Generate mesh
-    gmsh.model.mesh.generate(1)  # Curves
-    gmsh.model.mesh.generate(2)  # Surfaces
+    gmsh.model.mesh.generate(2)
 
     # Assign phases
     gmsh.write(f"{model_name}.msh")

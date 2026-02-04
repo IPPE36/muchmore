@@ -10,33 +10,147 @@ from scipy.ndimage import distance_transform_edt
 from skimage.measure import marching_cubes
 
 from source.timer import timer
+from source.abaqus import postprocess_inp
 
 ROOT = Path(__file__).resolve().parents[1]
 FREECAD_WORKER = str(ROOT / "source" / "freecad_utils.py")
 FREECAD_PYTHON = r"C:\Program Files\FreeCAD 1.0\bin\python.exe"
 
 
-def stl_to_step(stl_path: str, step_path: str, nx: int, ny: int, nz: int, verbose: bool = False):
-    p = subprocess.run(
-        [FREECAD_PYTHON, FREECAD_WORKER, stl_path, step_path, str(nx), str(ny), str(nz)],
+def _tag_rve_sides_from_volumes(vol_tags: list[int], tol: float = 1e-6):
+    """
+    Create 6 PhysicalGroup(2, ...) for the outer RVE cube sides.
+    Works by:
+    - collecting boundary faces of all volumes,
+    - computing global min/max coordinates,
+    - classifying faces whose bbox touches a global min/max plane.
+    IMPORTANT: this uses the *actual* geometry coordinates in Gmsh,
+    so it works even if your model is shifted (e.g., [-L,0] instead of [0,L]).
+    """
+    names = ("XMIN", "XMAX", "YMIN", "YMAX", "ZMIN", "ZMAX")
+
+    # Collect all boundary faces
+    faces = _get_volume_boundary_faces(vol_tags)
+
+    # Determine global bbox of the whole model using face bboxes
+    gmin = np.array([+np.inf, +np.inf, +np.inf], dtype=float)
+    gmax = np.array([-np.inf, -np.inf, -np.inf], dtype=float)
+    for f in faces:
+        xmin, ymin, zmin, xmax, ymax, zmax = gmsh.model.getBoundingBox(2, f)
+        gmin = np.minimum(gmin, [xmin, ymin, zmin])
+        gmax = np.maximum(gmax, [xmax, ymax, zmax])
+
+    xmin_g, ymin_g, zmin_g = gmin
+    xmax_g, ymax_g, zmax_g = gmax
+
+    x_min_faces, x_max_faces = [], []
+    y_min_faces, y_max_faces = [], []
+    z_min_faces, z_max_faces = [], []
+
+    for f in faces:
+        xmin, ymin, zmin, xmax, ymax, zmax = gmsh.model.getBoundingBox(2, f)
+
+        # a face “belongs to plane” if its bbox touches the global plane within tol
+        if abs(xmin - xmin_g) <= tol and abs(xmax - xmin_g) <= tol:
+            x_min_faces.append(f)
+        if abs(xmin - xmax_g) <= tol and abs(xmax - xmax_g) <= tol:
+            x_max_faces.append(f)
+
+        if abs(ymin - ymin_g) <= tol and abs(ymax - ymin_g) <= tol:
+            y_min_faces.append(f)
+        if abs(ymin - ymax_g) <= tol and abs(ymax - ymax_g) <= tol:
+            y_max_faces.append(f)
+
+        if abs(zmin - zmin_g) <= tol and abs(zmax - zmin_g) <= tol:
+            z_min_faces.append(f)
+        if abs(zmin - zmax_g) <= tol and abs(zmax - zmax_g) <= tol:
+            z_max_faces.append(f)
+
+    side_map = {
+        names[0]: x_min_faces,
+        names[1]: x_max_faces,
+        names[2]: y_min_faces,
+        names[3]: y_max_faces,
+        names[4]: z_min_faces,
+        names[5]: z_max_faces,
+    }
+
+    for nm, ftags in side_map.items():
+        if not ftags:
+            raise RuntimeError(f"Could not detect side {nm} (no faces classified). Check tol/geometry.")
+        gmsh.model.addPhysicalGroup(2, ftags, name=nm)
+
+    return side_map
+
+
+def _round_key(xyz, tol: float) -> tuple[int, int, int]:
+    """stable “binning” for matching coincident faces"""
+    return tuple(int(round(c / tol)) for c in xyz)
+
+
+def _get_volume_boundary_faces(vol_tags: list[int]) -> list[int]:
+    faces = set()
+    for v in vol_tags:
+        for dim, tag in gmsh.model.getBoundary([(3, v)], oriented=False, recursive=False):
+            if dim == 2:
+                faces.add(tag)
+    return sorted(faces)
+
+
+def _match_interface_faces_by_com(
+    a_faces: list[int],
+    b_faces: list[int],
+    tol: float = 1e-6,
+) -> tuple[list[int], list[int]]:
+    """
+    Match interface faces between A and B by Center-of-Mass (COM) within a tolerance.
+    Assumes the interface geometry is perfect and coincident.
+    """
+    b_map: dict[tuple[int, int, int], list[int]] = {}
+    for f in b_faces:
+        com = gmsh.model.occ.getCenterOfMass(2, f)
+        b_map.setdefault(_round_key(com, tol), []).append(f)
+
+    a_iface, b_iface = [], []
+    for f in a_faces:
+        com = gmsh.model.occ.getCenterOfMass(2, f)
+        key = _round_key(com, tol)
+        candidates = b_map.get(key, [])
+        if candidates:
+            # if multiple candidates exist, just take one; geometry should make this 1-1
+            g = candidates.pop()
+            a_iface.append(f)
+            b_iface.append(g)
+
+    return a_iface, b_iface
+
+
+def _import_and_get_new_volume_tags(path: str) -> list[int]:
+    """import shapes from a step file and extract tags"""
+    before = set(gmsh.model.getEntities(3))
+    gmsh.model.occ.importShapes(path)
+    gmsh.model.occ.synchronize()
+    after = set(gmsh.model.getEntities(3))
+    new = list(after - before)
+    return [tag for _, tag in new]
+
+
+def stl_to_step(stl_path: str, a_path: str, b_path: str, nx: int, ny: int, nz: int):
+    subprocess.run(
+        [FREECAD_PYTHON, FREECAD_WORKER, stl_path, a_path, b_path, str(nx), str(ny), str(nz)],
         text=True,
         capture_output=True
     )
-    if verbose:
-        print("returncode:", p.returncode)
-        print("STDOUT:\n", p.stdout)
-        print("STDERR:\n", p.stderr)
-    return step_path
 
 
-def clean_pv(poly: pv.PolyData, tol: float = 1e-6) -> pv.PolyData:
+def _clean_pv(poly: pv.PolyData, tol: float = 1e-6) -> pv.PolyData:
     poly = poly.triangulate()
     poly = poly.clean(tolerance=tol)
     poly = poly.compute_normals(auto_orient_normals=True, consistent_normals=True)
     return poly
 
 
-def split_parts(poly: pv.PolyData):
+def _split_parts(poly: pv.PolyData):
     out = poly.connectivity(extraction_mode="all")
 
     # Newer PyVista: MultiBlock
@@ -55,7 +169,7 @@ def split_parts(poly: pv.PolyData):
     return parts
 
 
-def periodic_iso_surfaces(field, min_area: float = 50.0) -> List[pv.PolyData]:
+def periodic_iso_surfaces(field, min_area: float = 50.0, step_size: int = 2) -> List[pv.PolyData]:
 
     # --- tile field ---
     tiled = np.tile(field, (3, 3, 3)).astype(np.float32)
@@ -74,26 +188,36 @@ def periodic_iso_surfaces(field, min_area: float = 50.0) -> List[pv.PolyData]:
     phi = distance_transform_edt(mask) - distance_transform_edt(~mask)
 
     # --- marching cubes ---
-    verts_zyx, faces, _, _ = marching_cubes(phi, level=0.0, step_size=2, allow_degenerate=False)
+    verts_zyx, faces, _, _ = marching_cubes(phi, level=0.0, step_size=step_size, allow_degenerate=False)
     verts_xyz = verts_zyx[:, [2, 1, 0]]
-
     faces_pv = np.c_[np.full(len(faces), 3), faces].astype(np.int64).ravel()
     surf = pv.PolyData(verts_xyz, faces_pv)
 
     # --- split into connected components ---
-    return [p for p in split_parts(surf) if float(p.area) >= min_area]
+    return [p for p in _split_parts(surf) if float(p.area) >= min_area]
 
 
 def mesh_3d(
     field: np.ndarray,
     algo: Literal["frontal", "delaunay", "hxt"] = "frontal",
     element_order: Literal[1, 2] = 1,
-    lc: float = 0.3,
-    model_name: str = "new_rve",
-    show: bool = True,
+    char_len_factor: float = 1.0,
+    name_model: str = "RVE",
+    name_phase_a: str = "PHASE-A",
+    name_phase_b: str = "PHASE-B",
+    show: bool = False,
+    physical_spacing: float = 1.0,
 ):
-    stl_path = str(ROOT / "temp" / f"{model_name}.stl")
-    step_path = str(ROOT / "temp" / f"{model_name}.step")
+
+    stl_path = str(ROOT / "temp" / f"{name_model}.stl")
+    inp_path = str(ROOT / "temp" / f"{name_model}.inp")
+    out_path = inp_path.replace(".inp", "_post.inp")
+    a_path = str(ROOT / "temp" / f"{name_model}_{name_phase_a}.step")
+    b_path = str(ROOT / "temp" / f"{name_model}_{name_phase_b}.step")
+
+    with timer("POSTPROCESS INP"):
+        postprocess_inp(inp_path, out_path, name_model, name_phase_a, name_phase_b)
+    exit()
 
     nx, ny, nz = field.shape
     rve = GenericRVE(
@@ -101,22 +225,15 @@ def mesh_3d(
         origin=[0.0, 0.0, 0.0],
         periodicityFlags=[1, 1, 1],
     )
-    gmsh.model.add(model_name)
-    occ = gmsh.model.occ
+    gmsh.model.add(name_model)
 
-    algo_dict = {
-        "delaunay": 1,  # default
-        "frontal": 4,  # most robust/slower
-        "hxt": 10,  # hex dominated
-    }
-
-    algo = algo_dict[algo]
+    algo = {"delaunay": 1, "frontal": 4, "hxt": 10}[algo]
     gmsh.option.setNumber("Mesh.CharacteristicLengthFromPoints", 1)
     gmsh.option.setNumber("Mesh.CharacteristicLengthFromCurvature", 0)
     gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
     gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 1)
     gmsh.option.setNumber("Mesh.ElementOrder", element_order)
-    gmsh.option.setNumber("Mesh.CharacteristicLengthFactor", lc)
+    gmsh.option.setNumber("Mesh.CharacteristicLengthFactor", char_len_factor)
     gmsh.option.setNumber("Mesh.Algorithm3D", algo)
     gmsh.option.setNumber("Mesh.OptimizeNetgen", 1)
     gmsh.option.setNumber("Mesh.Optimize", 1)
@@ -125,27 +242,41 @@ def mesh_3d(
     gmsh.option.setNumber("General.Verbosity", 0)
 
     with timer("MARSHING CUBES"):
-        parts = periodic_iso_surfaces(field)
+        parts = periodic_iso_surfaces(field, step_size=nx//32)
         shift = np.array([nx, ny, nz], dtype=float)
-        parts = [clean_pv(p.translate(-shift, inplace=False)) for p in parts]
+        parts = [_clean_pv(p.translate(-shift, inplace=False)) for p in parts]
         merged = pv.merge(parts)
         merged.save(stl_path)
 
     with timer("FREECAD STEP"):
-        stl_to_step(stl_path, step_path, nx, ny, nz)
+        stl_to_step(stl_path, a_path, b_path, nx, ny, nz)
+
+    with timer("GMSH LOAD A"):
+        a_tags = _import_and_get_new_volume_tags(a_path)
+
+    with timer("GMSH LOAD B"):
+        b_tags = _import_and_get_new_volume_tags(b_path)
 
     with timer("GMSH SETUP"):
-        occ.importShapes(step_path)
-        occ.synchronize()
-        occ.removeAllDuplicates()
-        occ.synchronize()
+        gmsh.model.occ.synchronize()
+        gmsh.model.addPhysicalGroup(3, a_tags, name=name_phase_a)
+        gmsh.model.addPhysicalGroup(3, b_tags, name=name_phase_b)
+        a_faces = _get_volume_boundary_faces(a_tags)
+        b_faces = _get_volume_boundary_faces(b_tags)
+        a_iface, b_iface = _match_interface_faces_by_com(a_faces, b_faces, tol=1e-6)
+        gmsh.model.addPhysicalGroup(2, a_iface, name=f"{name_phase_a}-IF")
+        gmsh.model.addPhysicalGroup(2, b_iface, name=f"{name_phase_b}-IF")
+        _tag_rve_sides_from_volumes(list(a_tags) + list(b_tags), tol=1e-6)
         rve.setupPeriodicity()
 
     with timer("MESHING VOLUMES"):
         gmsh.model.mesh.generate(3)
 
     with timer("STORE RVE"):
-        gmsh.write(f"{model_name}.inp")
+        gmsh.write(inp_path)
+
+    with timer("POSTPROCESS INP"):
+        postprocess_inp(inp_path, out_path, name_model, name_phase_a, name_phase_b)
 
     if show:
         gmsh.fltk.run()
