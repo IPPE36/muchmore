@@ -4,10 +4,13 @@ from scipy.ndimage import label
 from numpy.fft import fftfreq, rfftfreq, irfftn
 from joblib import Memory
 
+from source.timer import timed
+
 
 memory = Memory(".cache", verbose=0)
 
 
+@timed("Sample field SRF")
 def sample_field_srf(
         dim: int = 2,
         vf: float = 0.5,
@@ -55,6 +58,7 @@ def sample_field_srf(
     return field.astype(np.uint8)
 
 
+@timed("Sample field GRF")
 @memory.cache
 def sample_field_grf(
         dim: int = 2,

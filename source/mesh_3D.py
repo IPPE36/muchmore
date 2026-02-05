@@ -17,77 +17,6 @@ FREECAD_WORKER = str(ROOT / "source" / "freecad_utils.py")
 FREECAD_PYTHON = r"C:\Program Files\FreeCAD 1.0\bin\python.exe"
 
 
-def _tag_rve_sides_from_volumes(vol_tags: list[int], tol: float = 1e-6):
-    """
-    Create 6 PhysicalGroup(2, ...) for the outer RVE cube sides.
-    Works by:
-    - collecting boundary faces of all volumes,
-    - computing global min/max coordinates,
-    - classifying faces whose bbox touches a global min/max plane.
-    IMPORTANT: this uses the *actual* geometry coordinates in Gmsh,
-    so it works even if your model is shifted (e.g., [-L,0] instead of [0,L]).
-    """
-    names = ("XMIN", "XMAX", "YMIN", "YMAX", "ZMIN", "ZMAX")
-
-    # Collect all boundary faces
-    faces = _get_volume_boundary_faces(vol_tags)
-
-    # Determine global bbox of the whole model using face bboxes
-    gmin = np.array([+np.inf, +np.inf, +np.inf], dtype=float)
-    gmax = np.array([-np.inf, -np.inf, -np.inf], dtype=float)
-    for f in faces:
-        xmin, ymin, zmin, xmax, ymax, zmax = gmsh.model.getBoundingBox(2, f)
-        gmin = np.minimum(gmin, [xmin, ymin, zmin])
-        gmax = np.maximum(gmax, [xmax, ymax, zmax])
-
-    xmin_g, ymin_g, zmin_g = gmin
-    xmax_g, ymax_g, zmax_g = gmax
-
-    x_min_faces, x_max_faces = [], []
-    y_min_faces, y_max_faces = [], []
-    z_min_faces, z_max_faces = [], []
-
-    for f in faces:
-        xmin, ymin, zmin, xmax, ymax, zmax = gmsh.model.getBoundingBox(2, f)
-
-        # a face “belongs to plane” if its bbox touches the global plane within tol
-        if abs(xmin - xmin_g) <= tol and abs(xmax - xmin_g) <= tol:
-            x_min_faces.append(f)
-        if abs(xmin - xmax_g) <= tol and abs(xmax - xmax_g) <= tol:
-            x_max_faces.append(f)
-
-        if abs(ymin - ymin_g) <= tol and abs(ymax - ymin_g) <= tol:
-            y_min_faces.append(f)
-        if abs(ymin - ymax_g) <= tol and abs(ymax - ymax_g) <= tol:
-            y_max_faces.append(f)
-
-        if abs(zmin - zmin_g) <= tol and abs(zmax - zmin_g) <= tol:
-            z_min_faces.append(f)
-        if abs(zmin - zmax_g) <= tol and abs(zmax - zmax_g) <= tol:
-            z_max_faces.append(f)
-
-    side_map = {
-        names[0]: x_min_faces,
-        names[1]: x_max_faces,
-        names[2]: y_min_faces,
-        names[3]: y_max_faces,
-        names[4]: z_min_faces,
-        names[5]: z_max_faces,
-    }
-
-    for nm, ftags in side_map.items():
-        if not ftags:
-            raise RuntimeError(f"Could not detect side {nm} (no faces classified). Check tol/geometry.")
-        gmsh.model.addPhysicalGroup(2, ftags, name=nm)
-
-    return side_map
-
-
-def _round_key(xyz, tol: float) -> tuple[int, int, int]:
-    """stable “binning” for matching coincident faces"""
-    return tuple(int(round(c / tol)) for c in xyz)
-
-
 def _get_volume_boundary_faces(vol_tags: list[int]) -> list[int]:
     faces = set()
     for v in vol_tags:
@@ -106,6 +35,11 @@ def _match_interface_faces_by_com(
     Match interface faces between A and B by Center-of-Mass (COM) within a tolerance.
     Assumes the interface geometry is perfect and coincident.
     """
+
+    def _round_key(xyz, tol: float) -> tuple[int, int, int]:
+        """stable “binning” for matching coincident faces"""
+        return tuple(int(round(c / tol)) for c in xyz)
+
     b_map: dict[tuple[int, int, int], list[int]] = {}
     for f in b_faces:
         com = gmsh.model.occ.getCenterOfMass(2, f)
@@ -261,12 +195,11 @@ def mesh_3d(
         gmsh.model.occ.synchronize()
         gmsh.model.addPhysicalGroup(3, a_tags, name=name_phase_a)
         gmsh.model.addPhysicalGroup(3, b_tags, name=name_phase_b)
-        a_faces = _get_volume_boundary_faces(a_tags)
-        b_faces = _get_volume_boundary_faces(b_tags)
-        a_iface, b_iface = _match_interface_faces_by_com(a_faces, b_faces, tol=1e-6)
-        gmsh.model.addPhysicalGroup(2, a_iface, name=f"{name_phase_a}-IF")
-        gmsh.model.addPhysicalGroup(2, b_iface, name=f"{name_phase_b}-IF")
-        _tag_rve_sides_from_volumes(list(a_tags) + list(b_tags), tol=1e-6)
+        # a_faces = _get_volume_boundary_faces(a_tags)
+        # b_faces = _get_volume_boundary_faces(b_tags)
+        # a_iface, b_iface = _match_interface_faces_by_com(a_faces, b_faces, tol=1e-6)
+        # gmsh.model.addPhysicalGroup(2, a_iface, name=f"{name_phase_a}-IF")
+        # gmsh.model.addPhysicalGroup(2, b_iface, name=f"{name_phase_b}-IF")
         rve.setupPeriodicity()
 
     with timer("MESHING VOLUMES"):
