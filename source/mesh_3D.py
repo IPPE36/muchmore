@@ -36,19 +36,19 @@ def _match_interface_faces_by_com(
     Assumes the interface geometry is perfect and coincident.
     """
 
-    def _round_key(xyz, tol: float) -> tuple[int, int, int]:
+    def _round(xyz, tol: float) -> tuple[int, int, int]:
         """stable “binning” for matching coincident faces"""
         return tuple(int(round(c / tol)) for c in xyz)
 
     b_map: dict[tuple[int, int, int], list[int]] = {}
     for f in b_faces:
         com = gmsh.model.occ.getCenterOfMass(2, f)
-        b_map.setdefault(_round_key(com, tol), []).append(f)
+        b_map.setdefault(_round(com, tol), []).append(f)
 
     a_iface, b_iface = [], []
     for f in a_faces:
         com = gmsh.model.occ.getCenterOfMass(2, f)
-        key = _round_key(com, tol)
+        key = _round(com, tol)
         candidates = b_map.get(key, [])
         if candidates:
             # if multiple candidates exist, just take one; geometry should make this 1-1
@@ -195,11 +195,11 @@ def mesh_3d(
         gmsh.model.occ.synchronize()
         gmsh.model.addPhysicalGroup(3, a_tags, name=name_phase_a)
         gmsh.model.addPhysicalGroup(3, b_tags, name=name_phase_b)
-        # a_faces = _get_volume_boundary_faces(a_tags)
-        # b_faces = _get_volume_boundary_faces(b_tags)
-        # a_iface, b_iface = _match_interface_faces_by_com(a_faces, b_faces, tol=1e-6)
-        # gmsh.model.addPhysicalGroup(2, a_iface, name=f"{name_phase_a}-IF")
-        # gmsh.model.addPhysicalGroup(2, b_iface, name=f"{name_phase_b}-IF")
+        a_faces = _get_volume_boundary_faces(a_tags)
+        b_faces = _get_volume_boundary_faces(b_tags)
+        a_iface, b_iface = _match_interface_faces_by_com(a_faces, b_faces, tol=1e-6)
+        gmsh.model.addPhysicalGroup(2, a_iface, name=f"{name_phase_a}-IF")
+        gmsh.model.addPhysicalGroup(2, b_iface, name=f"{name_phase_b}-IF")
         rve.setupPeriodicity()
 
     with timer("MESHING VOLUMES"):
