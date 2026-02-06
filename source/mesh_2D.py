@@ -8,6 +8,8 @@ from shapely.geometry import Polygon, box
 from shapely.ops import unary_union
 from skimage.measure import find_contours
 
+from source.timer import timer
+
 
 def periodic_contours(field, min_area=5) -> List[Polygon]:
     """
@@ -77,99 +79,106 @@ def mesh_2d(
     field: np.ndarray,
     algo: Literal["frontal-delaunay", "delaunay"] = "frontal-delaunay",
     element_order: Literal[1, 2] = 2,
-    lc: float = 0.3,
-    model_name: str = "new_rve",
+    h: float = 0.03,
+    name_model: str = "RVE",
+    name_phase_a: str = "PHASE-A",
+    name_phase_b: str = "PHASE-B",
+    mesh_level: Literal[1, 2] = 2,
+    physical_spacing: float = 1.0,
     show: bool = True,
 ):
 
-    polygons = periodic_contours(field)
-    ny, nx = field.shape
+    with timer("Find Contours"):
+        polygons = periodic_contours(field)
 
     # Shift polygons into origin tile
+    ny, nx = field.shape
     polys = []
     for poly in polygons:
         p = translate(poly, xoff=-nx, yoff=-ny)
         p = p.simplify(0.5, preserve_topology=True)
         polys.append(p)
 
-    gmsh.initialize()
-    gmsh.model.add(model_name)
-    occ = gmsh.model.occ
-
     rve = GenericRVE(
         size=[float(nx), float(ny), 0.0],
         origin=[0.0, 0.0, 0.0],
         periodicityFlags=[1, 1, 0],
     )
+    gmsh.model.add(name_model)
 
-    # Inclusion surfaces (now also in origin coordinates)
-    surfs = []
-    for poly in polys:
-        if poly.is_empty or (not poly.is_valid) or poly.area <= 0:
-            continue
-        loop = polygon_to_loop(gmsh.model, poly)
-        surf = occ.addPlaneSurface([loop])
-        surfs.append(surf)
-    occ.synchronize()
-
-    # RVE at origin
-    rect = occ.addRectangle(0, 0, 0, nx, ny)
-
-    # Mutual fragmentation: every surface is fragmented against every other
-    objs = [(2, rect)] + [(2, s) for s in surfs]
-    outDimTags, outMap = occ.fragment(objs, [])
-    occ.synchronize()
-
-    # Clip inclusions to the rve
-    rect = occ.addRectangle(0, 0, 0, nx, ny)
-    volumes = gmsh.model.occ.getEntities(dim=2)
-    out, _ = gmsh.model.occ.intersect(
-        volumes,
-        [(2, rect)],
-        removeObject=True,
-        removeTool=True
-    )
-    gmsh.model.occ.synchronize()
-
-    matrix_surfs = sorted({tag for (dim, tag) in outMap[0] if dim == 2})
-    inclusion_surfs = sorted({
-        tag
-        for m in outMap[1:]
-        for (dim, tag) in m
-        if dim == 2
-    })
-
-    # --- Physical groups ---
-    gmsh.model.addPhysicalGroup(2, inclusion_surfs, tag=1)
-    gmsh.model.setPhysicalName(2, 1, "inclusions")
-    gmsh.model.addPhysicalGroup(2, matrix_surfs, tag=2)
-    gmsh.model.setPhysicalName(2, 2, "matrix")
-
-    rve.setupPeriodicity()
-
-    algo_dict = {
-        "delaunay": 5,  # default
-        "frontal-delaunay": 6,  # most robust, a little slower
-    }
-    algo = algo_dict[algo]
-
-    # Mesh options
-    gmsh.option.setNumber("Mesh.CharacteristicLengthFromPoints", 1)
-    gmsh.option.setNumber("Mesh.CharacteristicLengthFromCurvature", 1)
-    gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 1)
-    gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 1)
+    h = np.sqrt(nx**2 + ny**2) * h
+    gmsh.option.setNumber("Mesh.CharacteristicLengthFromPoints", 0)
+    gmsh.option.setNumber("Mesh.CharacteristicLengthFromCurvature", 0)
+    gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 0)
+    gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
+    gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 0)
+    gmsh.option.setNumber("Mesh.MeshSizeMin", 0.5 * h)
+    gmsh.option.setNumber("Mesh.MeshSizeMax", 2.0 * h)
+    f = gmsh.model.mesh.field.add("MathEval")
+    gmsh.model.mesh.field.setString(f, "F", str(h))
+    gmsh.model.mesh.field.setAsBackgroundMesh(f)
     gmsh.option.setNumber("Mesh.ElementOrder", element_order)
-    gmsh.option.setNumber("Mesh.CharacteristicLengthFactor", lc)
-    gmsh.option.setNumber("Mesh.Algorithm", algo)
+    algo = {"delaunay": 5, "frontal-delaunay": 6}[algo]
+    gmsh.option.setNumber("Mesh.Algorithm3D", algo)
+    gmsh.option.setNumber("Mesh.OptimizeNetgen", 1)
     gmsh.option.setNumber("Mesh.Optimize", 1)
     gmsh.option.setNumber("Mesh.ColorCarousel", 1)
-    gmsh.option.setNumber("General.Verbosity", 5)
+    gmsh.option.setNumber("Mesh.Format", 39)  # = ABAQUS .inp
+    gmsh.option.setNumber("General.Verbosity", 0)
+    occ = gmsh.model.occ
 
-    # Generate mesh
-    gmsh.model.mesh.generate(2)
+    with timer("Setup Geometry"):
 
-    # Assign phases
-    gmsh.write(f"{model_name}.msh")
+        # Inclusion surfaces (now also in origin coordinates)
+        surfs = []
+        for poly in polys:
+            if poly.is_empty or (not poly.is_valid) or poly.area <= 0:
+                continue
+            loop = polygon_to_loop(gmsh.model, poly)
+            surf = occ.addPlaneSurface([loop])
+            surfs.append(surf)
+        occ.synchronize()
+
+        # RVE at origin
+        rect = occ.addRectangle(0, 0, 0, nx, ny)
+
+        # Mutual fragmentation: every surface is fragmented against every other
+        objs = [(2, rect)] + [(2, s) for s in surfs]
+        outDimTags, outMap = occ.fragment(objs, [])
+        occ.synchronize()
+
+        # Clip inclusions to the rve
+        rect = occ.addRectangle(0, 0, 0, nx, ny)
+        volumes = gmsh.model.occ.getEntities(dim=2)
+        out, _ = gmsh.model.occ.intersect(
+            volumes,
+            [(2, rect)],
+            removeObject=True,
+            removeTool=True
+        )
+        gmsh.model.occ.synchronize()
+
+        matrix_surfs = sorted({tag for (dim, tag) in outMap[0] if dim == 2})
+        inclusion_surfs = sorted({
+            tag
+            for m in outMap[1:]
+            for (dim, tag) in m
+            if dim == 2
+        })
+
+        # --- Physical groups ---
+        gmsh.model.addPhysicalGroup(2, inclusion_surfs, tag=1)
+        gmsh.model.setPhysicalName(2, 1, "inclusions")
+        gmsh.model.addPhysicalGroup(2, matrix_surfs, tag=2)
+        gmsh.model.setPhysicalName(2, 2, "matrix")
+
+        rve.setupPeriodicity()
+
+    with timer("MESHING"):
+        gmsh.model.mesh.generate(mesh_level)
+
+    with timer("STORE RVE"):
+        gmsh.write(f"{name_model}.inp")
 
     if show:
         gmsh.fltk.run()

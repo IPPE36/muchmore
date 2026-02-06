@@ -134,13 +134,14 @@ def periodic_iso_surfaces(field, min_area: float = 50.0, step_size: int = 2) -> 
 def mesh_3d(
     field: np.ndarray,
     algo: Literal["frontal", "delaunay", "hxt"] = "frontal",
-    element_order: Literal[1, 2] = 1,
-    char_len_factor: float = 1.0,
+    element_order: Literal[1, 2] = 2,
+    h: float = 0.05,
     name_model: str = "RVE",
     name_phase_a: str = "PHASE-A",
     name_phase_b: str = "PHASE-B",
-    show: bool = False,
+    mesh_level: Literal[1, 2, 3] = 3,
     physical_spacing: float = 1.0,
+    show: bool = False,
 ):
 
     stl_path = str(ROOT / "temp" / f"{name_model}.stl")
@@ -148,10 +149,6 @@ def mesh_3d(
     out_path = inp_path.replace(".inp", "_post.inp")
     a_path = str(ROOT / "temp" / f"{name_model}_{name_phase_a}.step")
     b_path = str(ROOT / "temp" / f"{name_model}_{name_phase_b}.step")
-
-    with timer("POSTPROCESS INP"):
-        postprocess_inp(inp_path, out_path, name_model, name_phase_a, name_phase_b)
-    exit()
 
     nx, ny, nz = field.shape
     rve = GenericRVE(
@@ -161,13 +158,19 @@ def mesh_3d(
     )
     gmsh.model.add(name_model)
 
-    algo = {"delaunay": 1, "frontal": 4, "hxt": 10}[algo]
-    gmsh.option.setNumber("Mesh.CharacteristicLengthFromPoints", 1)
+    h = np.sqrt(nx**2 + ny**2 + nz**2) * h
+    gmsh.option.setNumber("Mesh.CharacteristicLengthFromPoints", 0)
     gmsh.option.setNumber("Mesh.CharacteristicLengthFromCurvature", 0)
+    gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 0)
     gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
-    gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 1)
+    gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 0)
+    gmsh.option.setNumber("Mesh.MeshSizeMin", 0.5 * h)
+    gmsh.option.setNumber("Mesh.MeshSizeMax", 2.0 * h)
+    f = gmsh.model.mesh.field.add("MathEval")
+    gmsh.model.mesh.field.setString(f, "F", str(h))
+    gmsh.model.mesh.field.setAsBackgroundMesh(f)
     gmsh.option.setNumber("Mesh.ElementOrder", element_order)
-    gmsh.option.setNumber("Mesh.CharacteristicLengthFactor", char_len_factor)
+    algo = {"delaunay": 1, "frontal": 4, "hxt": 10}[algo]
     gmsh.option.setNumber("Mesh.Algorithm3D", algo)
     gmsh.option.setNumber("Mesh.OptimizeNetgen", 1)
     gmsh.option.setNumber("Mesh.Optimize", 1)
@@ -202,17 +205,17 @@ def mesh_3d(
         gmsh.model.addPhysicalGroup(2, b_iface, name=f"{name_phase_b}-IF")
         rve.setupPeriodicity()
 
-    with timer("MESHING VOLUMES"):
-        gmsh.model.mesh.generate(3)
+    with timer("MESHING"):
+        gmsh.model.mesh.generate(mesh_level)
 
     with timer("STORE RVE"):
         gmsh.write(inp_path)
 
-    with timer("POSTPROCESS INP"):
-        postprocess_inp(inp_path, out_path, name_model, name_phase_a, name_phase_b)
-
     if show:
         gmsh.fltk.run()
+
+    with timer("POSTPROCESS INP"):
+        postprocess_inp(inp_path, out_path, name_model, name_phase_a, name_phase_b)
 
     gmsh.finalize()
 

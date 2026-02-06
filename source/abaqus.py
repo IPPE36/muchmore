@@ -6,45 +6,9 @@ from pathlib import Path
 from typing import Dict
 from typing import List, Tuple, Literal, Set
 
+from source.elements import face_to_nodes_mapping, nodes_to_face_mapping
+
 _element_hdr = re.compile(r"^\s*\*ELEMENT\b", re.IGNORECASE)
-
-
-def _pair_overlapping(nodes, nodes_a, nodes_b, tol=1e-6):
-    """
-    Find overlapping nodes between phase A and phase B by coordinates.
-
-    Returns
-    -------
-    tuple[list[int], list[int]]
-        Two lists:
-        - node IDs from phase A
-        - corresponding node IDs from phase B
-    """
-
-    def _round(x, y, z):
-        return (round(x / tol), round(y / tol), round(z / tol))
-
-    # build coordinate map for phase B
-    coord_map_b = {}
-    for nid in nodes_b:
-        x, y, z = nodes[nid]
-        k = _round(x, y, z)
-        if k not in coord_map_b:
-            coord_map_b[k] = nid
-
-    nodesA = []
-    nodesB = []
-
-    # match phase A nodes against phase B
-    for nid_a in nodes_a:
-        x, y, z = nodes[nid_a]
-        k = _round(x, y, z)
-        nid_b = coord_map_b.get(k)
-        if nid_b is not None:
-            nodesA.append(nid_a)
-            nodesB.append(nid_b)
-
-    return nodesA, nodesB
 
 
 def _read_elset(lines: List[str], elset_name: str) -> Set[int]:
@@ -105,12 +69,7 @@ def _read_elset(lines: List[str], elset_name: str) -> Set[int]:
     return elements
 
 
-def _is_3d_continuum(etype: str) -> bool:
-    t = (etype or "").strip().upper()
-    return t.startswith("C3D")  # covers C3D4, C3D10, C3D8R, C3D20R, ...
-
-
-def _classify_rve_boundary_nodes(side_nodes: dict) -> dict:
+def _classify_boundary_nodes(side_nodes: dict) -> dict:
     """
     side_nodes: dict with keys {"XMIN","XMAX","YMIN","YMAX","ZMIN","ZMAX"} mapping to node-id lists.
     Returns a dict with:
@@ -177,89 +136,6 @@ def _classify_rve_boundary_nodes(side_nodes: dict) -> dict:
         face_interior[f"F_{face}"] = sorted(interior)
 
     return {"corners": corners, "edges": edges, "faces": face_interior}
-
-
-def _clean_3d_continuum(body_lines: List[str],
-                        elem_conn: Dict[int, List[int]],
-                        elem_type: Dict[int, str]) -> List[str]:
-    """
-    Replaces the *ELEMENT section in `body_lines` with freshly generated element
-    connectivity from elem_conn/elem_type (after any remapping/merging).
-    Keeps everything before the first *ELEMENT and everything after the element
-    section unchanged.
-    """
-    # Find first *ELEMENT line
-    first_elem = None
-    for i, line in enumerate(body_lines):
-        if _element_hdr.match(line):
-            first_elem = i
-            break
-    if first_elem is None:
-        return body_lines[:]
-
-    # Find end of element section (first keyword after element blocks)
-    post_start = None
-    i = first_elem
-    while i < len(body_lines):
-        if _element_hdr.match(body_lines[i]):
-            i += 1
-            while i < len(body_lines) and not body_lines[i].lstrip().startswith("*"):
-                i += 1
-            continue
-        if body_lines[i].lstrip().startswith("*"):
-            post_start = i
-            break
-        i += 1
-    if post_start is None:
-        post_start = len(body_lines)
-
-    preamble = body_lines[:first_elem]
-    postamble = body_lines[post_start:]
-
-    # Preserve first-seen TYPE order from the original file
-    type_order: List[str] = []
-    seen = set()
-    i = first_elem
-    while i < post_start:
-        ln = body_lines[i].lstrip()
-        if ln.upper().startswith("*ELEMENT"):
-            m = re.search(r"TYPE\s*=\s*([^,\s]+)", ln, flags=re.IGNORECASE)
-            et = (m.group(1).strip().upper() if m else "UNKNOWN")
-            if et not in seen:
-                seen.add(et)
-                type_order.append(et)
-        i += 1
-
-    # Bucket elements by type (only C3D*)
-    by_type: "OrderedDict[str, List[int]]" = OrderedDict()
-    for et in type_order:
-        if _is_3d_continuum(et):
-            by_type[et] = []
-
-    # Some types might exist in parsed elems but not in headers (rare); append them
-    for eid, et in elem_type.items():
-        et = (et or "UNKNOWN").upper()
-        if _is_3d_continuum(et) and et not in by_type:
-            by_type[et] = []
-
-    for eid, et in elem_type.items():
-        et = (et or "UNKNOWN").upper()
-        if _is_3d_continuum(et):
-            by_type.setdefault(et, []).append(eid)
-
-    out: List[str] = []
-    out.extend(preamble)
-
-    for et, eids in by_type.items():
-        if not eids:
-            continue
-        out.append(f"*ELEMENT, TYPE={et}\n")
-        for eid in eids:
-            conn = elem_conn[eid]
-            out.append(str(eid) + ", " + ", ".join(str(n) for n in conn) + "\n")
-
-    out.extend(postamble)
-    return out
 
 
 def _bbox(nodes: dict) -> tuple:
@@ -387,30 +263,6 @@ def _round_key(x, y, z, tol):
     return (round(x / tol), round(y / tol), round(z / tol))
 
 
-def _face_maps(elem_type):
-    """
-    Returns list of (local_node_indices_for_face, abaqus_face_label)
-    """
-    if elem_type == "C3D4":  # tet4
-        return [
-            ((0, 1, 2), "S1"),
-            ((0, 3, 1), "S2"),
-            ((1, 3, 2), "S3"),
-            ((2, 3, 0), "S4"),
-        ]
-    elif elem_type == "C3D8":  # hex8  (must match your node ordering!)
-        return [
-            ((0, 1, 2, 3), "S1"),
-            ((4, 5, 6, 7), "S2"),
-            ((0, 4, 5, 1), "S3"),
-            ((1, 5, 6, 2), "S4"),
-            ((2, 6, 7, 3), "S5"),
-            ((3, 7, 4, 0), "S6"),
-        ]
-    else:
-        raise ValueError(f"Unsupported elem_type={elem_type}. Add a face map.")
-
-
 def _solid_faces_from_surface_centroids(
     solid_elems,
     elem_conn,
@@ -453,7 +305,7 @@ def _solid_faces_from_surface_centroids(
 
     for eid in solid_elems:
         etype = elem_types[eid]
-        faces = _face_maps(etype)
+        faces = nodes_to_face_mapping(etype)
 
         conn = elem_conn[eid]
 
@@ -491,7 +343,7 @@ def _elem_centroid_2d(eid, elem_conn, nodes):
     return _centroid_of_nodes(conn, nodes)
 
 
-def _reindex_and_rebuild_3d_body(
+def _clean_body(
     nodes: Dict[int, Tuple[float, float, float]],
     elem_conn: Dict[int, List[int]],
     elem_types: Dict[int, str],
@@ -588,6 +440,61 @@ def _reindex_and_rebuild_3d_body(
     return out
 
 
+def surface_to_nodes(
+    lines: list[str],
+    surface_name: str,
+    elem_conn: dict[int, list[int]],
+    elem_type: dict[int, str],
+) -> set[int]:
+    """
+    Read an Abaqus *Surface, type=ELEMENT block and return the set of node IDs.
+
+    Parameters
+    ----------
+    lines : list[str]
+        Lines of the .inp file
+    surface_name : str
+        Name of the surface (case-insensitive)
+    elem_conn : dict[int, list[int]]
+        Element connectivity
+    elem_type : dict[int, str]
+        Element types
+
+    Returns
+    -------
+    set[int]
+        Node IDs belonging to the surface
+    """
+
+    surface_name = surface_name.upper()
+    nodes = set()
+
+    in_surface = False
+
+    for line in lines:
+        if not line.strip() or line.startswith("**"):
+            continue
+
+        if line.startswith("*"):
+            in_surface = False
+            if line.upper().startswith("*SURFACE") and f"NAME={surface_name}" in line.upper():
+                in_surface = True
+            continue
+
+        if in_surface:
+            eid_str, face = [p.strip() for p in line.split(",")]
+            eid = int(eid_str)
+
+            conn = elem_conn[eid]
+            fmap = face_to_nodes_mapping(elem_type[eid])
+
+            local_ids = fmap[face.upper()]
+            for i in local_ids:
+                nodes.add(conn[i])
+
+    return nodes
+
+
 def postprocess_inp(
     inp_path: str | Path,
     out_path: str | Path,
@@ -595,7 +502,7 @@ def postprocess_inp(
     name_phase_a: str = "PHASE-A",
     name_phase_b: str = "PHASE-B",
     load_case: Literal["Tensile-X", "Tensile-Y", "Tensile-Z", "Shear-XY", "Shear-XZ", "Shear-YZ"] = "Tensile-X",
-    strain: float = 0.03,
+    strain: float = 0.01,
 ) -> Path:
     """Convert an orphan Abaqus .inp (no *Part/*Assembly) into Part/Assembly."""
 
@@ -641,7 +548,6 @@ def postprocess_inp(
         elem_types=elem_type,
         tol=1e-6,
     )
-
     surf_b = _solid_faces_from_surface_centroids(
         solid_elems=elem_b_solid,
         elem_conn=elem_conn,
@@ -651,7 +557,7 @@ def postprocess_inp(
         tol=1e-6,
     )
 
-    cleaned_body = _reindex_and_rebuild_3d_body(
+    cleaned_body = _clean_body(
         nodes, elem_conn, elem_type, elem_a_solid, elem_b_solid, surf_a, surf_b,
         surf_name_a=name_iface_a,
         surf_name_b=name_iface_b,
@@ -662,10 +568,26 @@ def postprocess_inp(
 
     # --- node ids ---
     nodes = _parse_nodes(cleaned_body)
+    elem_conn, elem_type = _parse_elements(cleaned_body)
+    elem_a = _read_elset(cleaned_body, name_phase_a)
+    elem_b = _read_elset(cleaned_body, name_phase_b)
     nids_a = {nid for e in elem_a for nid in elem_conn[e]}
     nids_b = {nid for e in elem_b for nid in elem_conn[e]}
     nodes_a = {key: val for key, val in nodes.items() if key in nids_a}
     nodes_b = {key: val for key, val in nodes.items() if key in nids_b}
+
+    nids_a_iface = surface_to_nodes(
+        lines=cleaned_body,
+        surface_name=name_iface_a,
+        elem_conn=elem_conn,
+        elem_type=elem_type,
+    )
+    nids_b_iface = surface_to_nodes(
+        lines=cleaned_body,
+        surface_name=name_iface_b,
+        elem_conn=elem_conn,
+        elem_type=elem_type,
+    )
 
     # --- section assignments on PART level ---
     out.append("** --- section assignments ---\n")
@@ -706,12 +628,14 @@ def postprocess_inp(
     out.extend(_ref_points(rps))
 
     used_nsets = []
-    for phase_, nodes_ in zip([name_phase_b, name_phase_a], [nodes_b, nodes_a]):
+    for phase_, nodes_, nids_if_ in zip([name_phase_b, name_phase_a], [nodes_b, nodes_a], [nids_b_iface, nids_a_iface]):
         side_names = ["XMIN", "XMAX", "YMIN", "YMAX", "ZMIN", "ZMAX"]
         side_nodes = {k: [] for k in side_names}
 
         tol = 1e-6
         for n, (x, y, z) in nodes_.items():
+            if n in nids_if_:
+                continue
             if abs(x - xmin) < tol:
                 side_nodes["XMIN"].append(n)
             if abs(x - xmax) < tol:
@@ -728,7 +652,7 @@ def postprocess_inp(
         for key in side_names:
             side_nodes[key] = sorted(side_nodes[key])
 
-        boundary = _classify_rve_boundary_nodes(side_nodes)
+        boundary = _classify_boundary_nodes(side_nodes)
         for name, n in boundary["corners"].items():
             if len(n):
                 out.extend(_format_nset(f"{name}", n))
@@ -767,37 +691,41 @@ def postprocess_inp(
                     out.append(f"{rp}, {dof}, -1.0\n")
 
         # --- your pairings (unchanged) ---
-        P_YMIN_ZMAX1, M_YMIN_ZMIN1 = _pair_coords(nodes_, boundary["edges"]["E_YMIN_ZMAX"], boundary["edges"]["E_YMIN_ZMIN"], "Z")
-        P_YMAX_ZMAX2, M_YMIN_ZMAX2 = _pair_coords(nodes_, boundary["edges"]["E_YMAX_ZMAX"], boundary["edges"]["E_YMIN_ZMAX"], "Y")
-        P_YMAX_ZMIN3, M_YMAX_ZMAX3 = _pair_coords(nodes_, boundary["edges"]["E_YMAX_ZMIN"],
-                                                  boundary["edges"]["E_YMAX_ZMAX"], "Z")
+        # --- pair edges in the same topological order as Algorithm 1 (Interior-Edge) ---
+        # 1) x-direction related edges (RPX)
+        P_XMAX_ZMIN1, M_XMIN_ZMIN1 = _pair_coords(nodes_, boundary["edges"]["E_XMAX_ZMIN"], boundary["edges"]["E_XMIN_ZMIN"], "X")
+        P_XMAX_ZMAX2, M_XMIN_ZMAX2 = _pair_coords(nodes_, boundary["edges"]["E_XMAX_ZMAX"], boundary["edges"]["E_XMIN_ZMAX"], "X")
+        P_XMAX_YMIN3, M_XMIN_YMIN3 = _pair_coords(nodes_, boundary["edges"]["E_XMAX_YMIN"], boundary["edges"]["E_XMIN_YMIN"], "X")
+        P_XMAX_YMAX4, M_XMIN_YMAX4 = _pair_coords(nodes_, boundary["edges"]["E_XMAX_YMAX"], boundary["edges"]["E_XMIN_YMAX"], "X")
 
-        P_XMAX_ZMIN5, M_XMIN_ZMIN5 = _pair_coords(nodes_, boundary["edges"]["E_XMAX_ZMIN"],
-                                                  boundary["edges"]["E_XMIN_ZMIN"], "X")
-        P_XMIN_ZMAX6, M_XMIN_ZMIN6 = _pair_coords(nodes_, boundary["edges"]["E_XMIN_ZMAX"],
-                                                  boundary["edges"]["E_XMIN_ZMIN"], "Z")
-        P_XMAX_ZMAX7, M_XMIN_ZMAX7 = _pair_coords(nodes_, boundary["edges"]["E_XMAX_ZMAX"],
-                                                  boundary["edges"]["E_XMIN_ZMAX"], "X")
+        # 2) y-direction related edges (RPY)
+        P_YMAX_ZMIN5, M_YMIN_ZMIN5 = _pair_coords(nodes_, boundary["edges"]["E_YMAX_ZMIN"], boundary["edges"]["E_YMIN_ZMIN"], "Y")
+        P_YMAX_ZMAX6, M_YMIN_ZMAX6 = _pair_coords(nodes_, boundary["edges"]["E_YMAX_ZMAX"], boundary["edges"]["E_YMIN_ZMAX"], "Y")
+        P_YMAX_XMIN7, M_YMIN_XMIN7 = _pair_coords(nodes_, boundary["edges"]["E_XMIN_YMAX"], boundary["edges"]["E_XMIN_YMIN"], "Y")
+        P_YMAX_XMAX8, M_YMIN_XMAX8 = _pair_coords(nodes_, boundary["edges"]["E_XMAX_YMAX"], boundary["edges"]["E_XMAX_YMIN"], "Y")
 
-        P_XMIN_YMAX9, M_XMIN_YMIN9 = _pair_coords(nodes_, boundary["edges"]["E_XMIN_YMAX"],
-                                                  boundary["edges"]["E_XMIN_YMIN"], "Y")
-        P_XMAX_YMIN10, M_XMIN_YMIN10 = _pair_coords(nodes_, boundary["edges"]["E_XMAX_YMIN"],
-                                                    boundary["edges"]["E_XMIN_YMIN"], "X")
-        P_XMAX_YMAX11, M_XMAX_YMIN11 = _pair_coords(nodes_, boundary["edges"]["E_XMAX_YMAX"],
-                                                    boundary["edges"]["E_XMAX_YMIN"], "Y")
+        # 3) z-direction related edges (RPZ)
+        P_ZMAX_XMIN9, M_ZMIN_XMIN9 = _pair_coords(nodes_, boundary["edges"]["E_XMIN_ZMAX"], boundary["edges"]["E_XMIN_ZMIN"], "Z")
+        P_ZMAX_XMAX10, M_ZMIN_XMAX10 = _pair_coords(nodes_, boundary["edges"]["E_XMAX_ZMAX"], boundary["edges"]["E_XMAX_ZMIN"], "Z")
+        P_ZMAX_YMIN11, M_ZMIN_YMIN11 = _pair_coords(nodes_, boundary["edges"]["E_YMIN_ZMAX"], boundary["edges"]["E_YMIN_ZMIN"], "Z")
+        P_ZMAX_YMAX12, M_ZMIN_YMAX12 = _pair_coords(nodes_, boundary["edges"]["E_YMAX_ZMAX"], boundary["edges"]["E_YMAX_ZMIN"], "Z")
 
+        # --- Edge constraints list (keep your style) ---
+        # Each tuple: ((edge_plus, edge_minus, RP), (plus_nodes, minus_nodes))
+        # We only apply DOF corresponding to RP (directional), not dof=1..3.
         edges = [
-            (('E_YMIN_ZMAX', 'E_YMIN_ZMIN', 'RPZ'), (P_YMIN_ZMAX1, M_YMIN_ZMIN1)),
-            (('E_YMAX_ZMAX', 'E_YMIN_ZMAX', 'RPY'), (P_YMAX_ZMAX2, M_YMIN_ZMAX2)),
-            (('E_YMAX_ZMIN', 'E_YMAX_ZMAX', 'RPZ'), (P_YMAX_ZMIN3, M_YMAX_ZMAX3)),
-
-            (('E_XMAX_ZMIN', 'E_XMIN_ZMIN', 'RPX'), (P_XMAX_ZMIN5, M_XMIN_ZMIN5)),
-            (('E_XMIN_ZMAX', 'E_XMIN_ZMIN', 'RPZ'), (P_XMIN_ZMAX6, M_XMIN_ZMIN6)),
-            (('E_XMAX_ZMAX', 'E_XMIN_ZMAX', 'RPX'), (P_XMAX_ZMAX7, M_XMIN_ZMAX7)),
-
-            (('E_XMIN_YMAX', 'E_XMIN_YMIN', 'RPY'), (P_XMIN_YMAX9, M_XMIN_YMIN9)),
-            (('E_XMAX_YMIN', 'E_XMIN_YMIN', 'RPX'), (P_XMAX_YMIN10, M_XMIN_YMIN10)),
-            (('E_XMAX_YMAX', 'E_XMAX_YMIN', 'RPY'), (P_XMAX_YMAX11, M_XMAX_YMIN11)),
+            (('E_XMAX_ZMIN', 'E_XMIN_ZMIN', 'RPX'), (P_XMAX_ZMIN1, M_XMIN_ZMIN1)),
+            (('E_XMAX_ZMAX', 'E_XMIN_ZMAX', 'RPX'), (P_XMAX_ZMAX2, M_XMIN_ZMAX2)),
+            (('E_XMAX_YMIN', 'E_XMIN_YMIN', 'RPX'), (P_XMAX_YMIN3, M_XMIN_YMIN3)),
+            (('E_XMAX_YMAX', 'E_XMIN_YMAX', 'RPX'), (P_XMAX_YMAX4, M_XMIN_YMAX4)),
+            (('E_YMAX_ZMIN', 'E_YMIN_ZMIN', 'RPY'), (P_YMAX_ZMIN5, M_YMIN_ZMIN5)),
+            (('E_YMAX_ZMAX', 'E_YMIN_ZMAX', 'RPY'), (P_YMAX_ZMAX6, M_YMIN_ZMAX6)),
+            (('E_XMIN_YMAX', 'E_XMIN_YMIN', 'RPY'), (P_YMAX_XMIN7, M_YMIN_XMIN7)),
+            (('E_XMAX_YMAX', 'E_XMAX_YMIN', 'RPY'), (P_YMAX_XMAX8, M_YMIN_XMAX8)),
+            (('E_XMIN_ZMAX', 'E_XMIN_ZMIN', 'RPZ'), (P_ZMAX_XMIN9, M_ZMIN_XMIN9)),
+            (('E_XMAX_ZMAX', 'E_XMAX_ZMIN', 'RPZ'), (P_ZMAX_XMAX10, M_ZMIN_XMAX10)),
+            (('E_YMIN_ZMAX', 'E_YMIN_ZMIN', 'RPZ'), (P_ZMAX_YMIN11, M_ZMIN_YMIN11)),
+            (('E_YMAX_ZMAX', 'E_YMAX_ZMIN', 'RPZ'), (P_ZMAX_YMAX12, M_ZMIN_YMAX12)),
         ]
 
         rp_to_dof = {"RPX": 1, "RPY": 2, "RPZ": 3}
@@ -805,8 +733,7 @@ def postprocess_inp(
         for edge in edges:
             edge_plus, edge_minus, rp = edge[0]
             plus_nodes, minus_nodes = edge[1]
-
-            dof = rp_to_dof[rp]  # <--- only one DOF, no dof loop
+            dof = rp_to_dof[rp]  # directional DOF only
 
             for n_plus, n_minus in zip(plus_nodes, minus_nodes):
                 if n_plus not in used_nsets:
