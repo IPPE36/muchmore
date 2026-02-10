@@ -1,19 +1,25 @@
+from typing import Tuple
+
 import gstools as gs
 import numpy as np
-from scipy.ndimage import label
-from numpy.fft import fftfreq, rfftfreq, irfftn
 from joblib import Memory
+from numpy.fft import fftfreq, rfftfreq, irfftn
+from scipy.ndimage import label
+from skimage import filters
 
+from source.features import particle_features, ParticleStats
+from source.mesh_2D import mesh_2d
+from source.mesh_3D import mesh_3d
 from source.timer import timed
-
 
 memory = Memory(".cache", verbose=0)
 
 
 @timed("Sample field SRF")
+@memory.cache
 def sample_field_srf(
         dim: int = 2,
-        vf: float = 0.5,
+        vf_inclusion: float = 0.5,
         shape: int = 128,
         size: float = 30.0,
         len_scale: float = 1.0,
@@ -53,7 +59,7 @@ def sample_field_srf(
     )
 
     field = srf(pos, mesh_type="structured", post_process=False)
-    thresh = np.quantile(field, vf)
+    thresh = np.quantile(field, 1 - vf_inclusion)
     field = np.where(field <= thresh, 0, 1)
     return field.astype(np.uint8)
 
@@ -62,7 +68,7 @@ def sample_field_srf(
 @memory.cache
 def sample_field_grf(
         dim: int = 2,
-        vf: float = 0.5,
+        vf_inclusion: float = 0.5,
         shape: int = 128,
         size: float = 30.0,
         len_scale: float = 1.0,
@@ -120,7 +126,7 @@ def sample_field_grf(
         ax, ay, az = float(anis), 1.0, 1.0
         dx, dy, dz = Lx / nx, Ly / ny, Lz / nz
 
-        # wavenumbers
+        # wave numbers
         kx = (2.0 * np.pi) * fftfreq(nx, d=dx)
         ky = (2.0 * np.pi) * fftfreq(ny, d=dy)
         kz = (2.0 * np.pi) * rfftfreq(nz, d=dz)
@@ -155,7 +161,7 @@ def sample_field_grf(
         # ---- inverse FFT ----
         field = irfftn(F, s=(nx, ny, nz)).astype(np.float32, copy=False)
 
-    thresh = np.quantile(field, vf)
+    thresh = np.quantile(field, 1 - vf_inclusion)
     field = np.where(field <= thresh, 0, 1)
     return field.astype(np.uint8)
 
@@ -171,6 +177,27 @@ def load_field(filepath: str) -> np.ndarray:
 
 def dump_field(field: np.ndarray, filepath: str) -> None:
     np.save(filepath, field.astype(np.uint8))
+
+
+def mesh_field(field: np.ndarray, **kwargs):
+    if field.ndim == 2:
+        mesh_2d(field, **kwargs)
+    elif field.ndim == 3:
+        mesh_3d(field, **kwargs)
+    else:
+        raise ValueError("mesh_field requires a 2D or 3D array!")
+
+
+def segment_field(field: np.ndarray) -> np.ndarray:
+    threshold = filters.threshold_otsu(field)
+    return field > threshold
+
+
+@timed("Feature Extraction")
+def stats_field(field: np.ndarray, physical_spacing: float = 1.0) -> Tuple[ParticleStats, ParticleStats]:
+    stats = particle_features(field)
+    stats_mm = stats.apply_physical_scaling(physical_spacing=physical_spacing, ndim=field.ndim)
+    return stats, stats_mm
 
 
 if __name__ == "__main__":

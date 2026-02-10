@@ -86,7 +86,11 @@ def mesh_2d(
     mesh_level: Literal[1, 2] = 2,
     physical_spacing: float = 1.0,
     show: bool = True,
+    **kwargs,
 ):
+
+    if algo not in ["frontal-delaunay", "delaunay"]:
+        raise ValueError("Algorithm must be either frontal-delaunay or delaunay!")
 
     with timer("Find Contours"):
         polygons = periodic_contours(field)

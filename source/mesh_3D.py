@@ -6,11 +6,12 @@ import gmsh
 import numpy as np
 import pyvista as pv
 from gmshModel.Model.GenericRVE import GenericRVE
+from gmshModel.Model.RandomInclusionRVE import RandomInclusionRVE
 from scipy.ndimage import distance_transform_edt
 from skimage.measure import marching_cubes
 
 from source.timer import timer
-from source.abaqus import postprocess_inp
+from source.abaqus2 import postprocess_inp
 
 ROOT = Path(__file__).resolve().parents[1]
 FREECAD_WORKER = str(ROOT / "source" / "freecad_utils.py")
@@ -141,14 +142,24 @@ def mesh_3d(
     name_phase_b: str = "PHASE-B",
     mesh_level: Literal[1, 2, 3] = 3,
     physical_spacing: float = 1.0,
+    load_case: Literal["Tensile-X", "Tensile-Y", "Tensile-Z", "Shear-XY", "Shear-XZ", "Shear-YZ"] = "Tensile-X",
+    strain: float = 0.03,
     show: bool = False,
+    **kwargs,
 ):
+
+    if algo not in ["frontal", "delaunay", "hxt"]:
+        raise ValueError("Algorithm must be either frontal, delaunay or hxt!")
 
     stl_path = str(ROOT / "temp" / f"{name_model}.stl")
     inp_path = str(ROOT / "temp" / f"{name_model}.inp")
     out_path = inp_path.replace(".inp", "_post.inp")
     a_path = str(ROOT / "temp" / f"{name_model}_{name_phase_a}.step")
     b_path = str(ROOT / "temp" / f"{name_model}_{name_phase_b}.step")
+
+    with timer("POSTPROCESS INP"):
+        postprocess_inp(inp_path, out_path, name_model, name_phase_a, name_phase_b, load_case, strain, physical_spacing)
+    exit()
 
     nx, ny, nz = field.shape
     rve = GenericRVE(
@@ -164,8 +175,8 @@ def mesh_3d(
     gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 0)
     gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
     gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 0)
-    gmsh.option.setNumber("Mesh.MeshSizeMin", 0.5 * h)
-    gmsh.option.setNumber("Mesh.MeshSizeMax", 2.0 * h)
+    gmsh.option.setNumber("Mesh.MeshSizeMin", 0.75 * h)
+    gmsh.option.setNumber("Mesh.MeshSizeMax", 1.25 * h)
     f = gmsh.model.mesh.field.add("MathEval")
     gmsh.model.mesh.field.setString(f, "F", str(h))
     gmsh.model.mesh.field.setAsBackgroundMesh(f)
@@ -215,9 +226,89 @@ def mesh_3d(
         gmsh.fltk.run()
 
     with timer("POSTPROCESS INP"):
-        postprocess_inp(inp_path, out_path, name_model, name_phase_a, name_phase_b)
+        postprocess_inp(inp_path, out_path, name_model, name_phase_a, name_phase_b, load_case, strain, physical_spacing)
 
     gmsh.finalize()
+    return
+
+
+def mesh_3d_random_inclusion(
+        size: int = 128,
+        inclusion_sets: List[int] = [24, 12],  # place 12 inclusions with radius 24
+        algo: Literal["frontal", "delaunay", "hxt"] = "frontal",
+        element_order: Literal[1, 2] = 2,
+        name_model: str = "RVE",
+        max_attempts: int = 10000,
+        min_rel_dist_bnd: float = 0.1,
+        min_rel_dist_inc: float = 0.1,
+        name_phase_a: str = "PHASE-A",
+        name_phase_b: str = "PHASE-B",
+        physical_spacing: float = 1.0,
+        load_case: Literal["Tensile-X", "Tensile-Y", "Tensile-Z", "Shear-XY", "Shear-XZ", "Shear-YZ"] = "Tensile-X",
+        strain: float = 0.03,
+        show: bool = True,
+        **kwargs,
+):
+    init_params = {
+        "inclusionSets": inclusion_sets,
+        "inclusionType": "Sphere",
+        "size": [size] * 3,
+        "origin": [0, 0, 0],
+        "periodicityFlags": [1, 1, 1],
+        "domainGroup": name_phase_a,
+        "inclusionGroup": name_phase_b,
+        "gmshConfigChanges": {
+            "General.Terminal": 0,
+            "Mesh.CharacteristicLengthExtendFromBoundary": 0,
+            "Mesh.ElementOrder": element_order,
+            "Mesh.Algorithm3D": {"delaunay": 1, "frontal": 4, "hxt": 10}[algo],
+            "Mesh.OptimizeNetgen": 1,
+            "Mesh.Optimize": 1,
+            "Mesh.ColorCarousel": 1,
+            "Mesh.Format": 39,  # = ABAQUS .inp
+            "General.Verbosity": 0,
+        }
+    }
+    model_params = {
+        "placementOptions": {
+            "maxAttempts": max_attempts,
+            "min_rel_dist_bnd": min_rel_dist_bnd,
+            "minRelDistInc": min_rel_dist_inc
+        }
+    }
+    mesh_params = {
+        "threads": None,
+        "refinementOptions": {
+            "maxMeshSize": "auto",
+            "inclusionRefinement": True,
+            "interInclusionRefinement": True,
+            "elementsPerCircumference": 18,
+            "elementsBetweenInclusions": 3,
+            "inclusionRefinementWidth": 3,
+            "transitionElements": "auto",
+            "aspectRatio": 1.5
+        }
+    }
+    rve = RandomInclusionRVE(**init_params)
+
+    with timer("Setup Geometry"):
+        rve.createGmshModel(**model_params)
+
+    with timer("MESHING"):
+        rve.createMesh(**mesh_params)
+
+    with timer("STORE RVE"):
+        inp_path = str(ROOT / "temp" / f"{name_model}.inp")
+        rve.saveMesh(inp_path)
+
+    if show:
+        gmsh.fltk.run()
+
+    with timer("POSTPROCESS INP"):
+        out_path = inp_path.replace(".inp", "_post.inp")
+        postprocess_inp(inp_path, out_path, name_model, name_phase_a, name_phase_b, load_case, strain, physical_spacing)
+
+    return
 
 
 if __name__ == "__main__":

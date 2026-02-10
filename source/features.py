@@ -1,0 +1,143 @@
+from dataclasses import dataclass
+from typing import Sequence
+
+import numpy as np
+from scipy.ndimage import label
+from scipy.spatial import cKDTree
+from scipy.spatial.distance import euclidean
+from scipy.stats import gaussian_kde
+from skimage import feature
+
+
+@dataclass
+class ParticleStats:
+    n_particles: int
+    distance: np.ndarray
+    area: Sequence[float]
+    aspect_ratio: Sequence[float]
+    radius: Sequence[float]
+
+    @property
+    def mean_radius(self) -> float:
+        return np.mean(self.radius)
+
+    @property
+    def std_radius(self) -> float:
+        return np.std(self.radius)
+
+    @property
+    def mean_area(self) -> float:
+        return np.mean(self.area)
+
+    @property
+    def std_area(self) -> float:
+        return np.std(self.area)
+
+    @property
+    def mean_aspect_ratio(self) -> float:
+        return np.mean(self.aspect_ratio)
+
+    @property
+    def std_aspect_ratio(self) -> float:
+        return np.std(self.aspect_ratio)
+
+    def to_dict(self) -> dict:
+        """Flatten particle statistics into a serializable dict."""
+        return {
+            "n_particles": self.n_particles,
+            "mean_radius": self.mean_radius,
+            "std_radius": self.std_radius,
+            "mean_area": self.mean_area,
+            "std_area": self.std_area,
+            "mean_aspect_ratio": self.mean_aspect_ratio,
+            "std_aspect_ratio": self.std_aspect_ratio,
+            "radii": np.asarray(self.radius),
+            "areas": np.asarray(self.area),
+            "aspect_ratios": np.asarray(self.aspect_ratio),
+            "distances": np.asarray(self.distance),
+        }
+
+    def apply_physical_scaling(self, physical_spacing: float, ndim: int):
+        """Convert voxel-based quantities into physical units."""
+        ps = physical_spacing
+        return ParticleStats(
+            n_particles=self.n_particles,
+            distance=np.asarray(self.distance) * ps,
+            radius=np.asarray(self.radius) * ps,
+            area=np.asarray(self.area) * ps ** ndim,
+            aspect_ratio=self.aspect_ratio,
+        )
+
+    def to_inclusion_set(self):
+        kde = gaussian_kde(self.radius)
+        samples = kde.resample(self.n_particles).ravel()
+        samples = samples[np.where(samples > 0)[0]]
+        bins = min(20, len(samples))
+        counts, edges = np.histogram(samples, bins=bins)
+        centers = 0.5 * (edges[:-1] + edges[1:])
+        inclusion_set = np.empty(2 * len(counts))
+        inclusion_set[0::2] = centers
+        inclusion_set[1::2] = counts
+        return inclusion_set
+
+
+def chord_length(field: np.ndarray) -> tuple:
+    """Calculates chord length of inclusions of segmented image"""
+    edges = feature.canny(field)
+    boundary_points = np.argwhere(edges)
+    chord_lengths = []
+    for i in range(boundary_points.shape[0] - 1):
+        p1 = boundary_points[i]
+        p2 = boundary_points[i + 1]
+        chord_lengths.append(euclidean(p1, p2))
+    return np.mean(chord_lengths)
+
+
+def volume_fractions(x: np.ndarray) -> list:
+    """Calculates volume fraction of inclusions of segmented image"""
+    values, counts = np.unique(x, return_counts=True)
+    return [c / x.size for c in counts]
+
+
+def particle_features(x: np.ndarray, min_size: int = None) -> ParticleStats:
+    min_size = int(x.shape[0] * 0.075) if not min_size else min_size
+    mask, n = label(x)
+
+    centers, area, aspect_ratio, radius = [], [], [], []
+    n_particles = 0
+
+    for i in range(n):
+        points = np.array(np.where(mask == i + 1))
+        if points.shape[-1] >= min_size:
+            eigvals, _ = np.linalg.eig(np.cov(points))
+            ar = np.min(eigvals) / np.max(eigvals)
+            s = points.shape[-1]
+            c = points.mean(axis=-1)
+
+            # representative (equivalent) radius
+            if x.ndim == 2:
+                r = np.sqrt(s / np.pi)
+            elif x.ndim == 3:
+                r = (3 * s / (4 * np.pi)) ** (1 / 3)
+
+            aspect_ratio.append(ar)
+            area.append(s)
+            radius.append(r)
+            centers.append(c)
+            n_particles += 1
+
+    center_coords = np.array(centers)
+    tree = cKDTree(center_coords)
+    dists = tree.query(center_coords, x.ndim)
+
+    return ParticleStats(
+        n_particles=n_particles,
+        distance=dists[0][:, 1],
+        area=area,
+        aspect_ratio=aspect_ratio,
+        radius=radius,
+    )
+
+
+if __name__ == "__main__":
+    exit()
