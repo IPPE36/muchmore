@@ -51,10 +51,10 @@ class ParticleStats:
             "std_area": self.std_area,
             "mean_aspect_ratio": self.mean_aspect_ratio,
             "std_aspect_ratio": self.std_aspect_ratio,
-            "radii": np.asarray(self.radius),
-            "areas": np.asarray(self.area),
-            "aspect_ratios": np.asarray(self.aspect_ratio),
-            "distances": np.asarray(self.distance),
+            "radius": np.asarray(self.radius),
+            "area": np.asarray(self.area),
+            "aspect_ratio": np.asarray(self.aspect_ratio),
+            "distance": np.asarray(self.distance),
         }
 
     def apply_physical_scaling(self, physical_spacing: float, ndim: int):
@@ -70,15 +70,25 @@ class ParticleStats:
 
     def to_inclusion_set(self):
         kde = gaussian_kde(self.radius)
+
         samples = kde.resample(self.n_particles).ravel()
-        samples = samples[np.where(samples > 0)[0]]
-        bins = min(20, len(samples))
+        samples = samples[samples > 0]  # keep only physical radii
+
+        if samples.size == 0:
+            raise ValueError("KDE produced no positive radius samples")
+
+        bins = min(20, samples.size)
         counts, edges = np.histogram(samples, bins=bins)
+
         centers = 0.5 * (edges[:-1] + edges[1:])
-        inclusion_set = np.empty(2 * len(counts))
-        inclusion_set[0::2] = centers
-        inclusion_set[1::2] = counts
-        return inclusion_set
+
+        # build [(radius, amount), ...] with shape (N, 2)
+        inclusion_sets = np.column_stack((centers, counts))
+
+        # optional: drop empty bins
+        inclusion_sets = inclusion_sets[inclusion_sets[:, 1] > 0]
+
+        return inclusion_sets.tolist()
 
 
 def chord_length(field: np.ndarray) -> tuple:
@@ -100,7 +110,7 @@ def volume_fractions(x: np.ndarray) -> list:
 
 
 def particle_features(x: np.ndarray, min_size: int = None) -> ParticleStats:
-    min_size = int(x.shape[0] * 0.075) if not min_size else min_size
+    min_size = 25 if not min_size else min_size
     mask, n = label(x)
 
     centers, area, aspect_ratio, radius = [], [], [], []
@@ -108,23 +118,44 @@ def particle_features(x: np.ndarray, min_size: int = None) -> ParticleStats:
 
     for i in range(n):
         points = np.array(np.where(mask == i + 1))
-        if points.shape[-1] >= min_size:
-            eigvals, _ = np.linalg.eig(np.cov(points))
-            ar = np.min(eigvals) / np.max(eigvals)
-            s = points.shape[-1]
-            c = points.mean(axis=-1)
 
-            # representative (equivalent) radius
-            if x.ndim == 2:
-                r = np.sqrt(s / np.pi)
-            elif x.ndim == 3:
-                r = (3 * s / (4 * np.pi)) ** (1 / 3)
+        if points.shape[-1] < min_size:
+            continue
 
-            aspect_ratio.append(ar)
-            area.append(s)
-            radius.append(r)
-            centers.append(c)
-            n_particles += 1
+        n_particles += 1
+        s = points.shape[-1]
+        area.append(s)
+
+        # --- skip particles touching the border ---
+        touches_border = False
+        for d in range(x.ndim):
+            if (
+                    np.any(points[d] == 0) or
+                    np.any(points[d] == x.shape[d] - 1)
+            ):
+                touches_border = True
+                break
+
+        if touches_border:
+            continue
+        # ------------------------------------------
+
+        eigvals, _ = np.linalg.eig(np.cov(points))
+        ar = np.max(eigvals) / np.min(eigvals)
+        c = points.mean(axis=-1)
+
+        if ar < 0.5 or ar > 2:
+            continue
+
+        # representative (equivalent) radius
+        if x.ndim == 2:
+            r = np.sqrt(s / np.pi)
+        elif x.ndim == 3:
+            r = (3 * s / (4 * np.pi)) ** (1 / 3)
+
+        aspect_ratio.append(ar)
+        radius.append(r)
+        centers.append(c)
 
     center_coords = np.array(centers)
     tree = cKDTree(center_coords)
@@ -137,6 +168,8 @@ def particle_features(x: np.ndarray, min_size: int = None) -> ParticleStats:
         aspect_ratio=aspect_ratio,
         radius=radius,
     )
+
+
 
 
 if __name__ == "__main__":

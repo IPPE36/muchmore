@@ -10,8 +10,9 @@ from gmshModel.Model.RandomInclusionRVE import RandomInclusionRVE
 from scipy.ndimage import distance_transform_edt
 from skimage.measure import marching_cubes
 
+
 from source.timer import timer
-from source.abaqus2 import postprocess_inp
+from source.abaqus import postprocess_inp
 
 ROOT = Path(__file__).resolve().parents[1]
 FREECAD_WORKER = str(ROOT / "source" / "freecad_utils.py")
@@ -137,12 +138,14 @@ def mesh_3d(
     algo: Literal["frontal", "delaunay", "hxt"] = "frontal",
     element_order: Literal[1, 2] = 2,
     h: float = 0.05,
+    mesh_scale_min: float = 0.8,
+    mesh_scale_max: float = 1.2,
     name_model: str = "RVE",
     name_phase_a: str = "PHASE-A",
     name_phase_b: str = "PHASE-B",
     mesh_level: Literal[1, 2, 3] = 3,
     physical_spacing: float = 1.0,
-    load_case: Literal["Tensile-X", "Tensile-Y", "Tensile-Z", "Shear-XY", "Shear-XZ", "Shear-YZ"] = "Tensile-X",
+    load_case: Literal["Tensile-X", "Tensile-Y", "Tensile-Z"] = "Tensile-X",
     strain: float = 0.03,
     show: bool = False,
     **kwargs,
@@ -156,10 +159,6 @@ def mesh_3d(
     out_path = inp_path.replace(".inp", "_post.inp")
     a_path = str(ROOT / "temp" / f"{name_model}_{name_phase_a}.step")
     b_path = str(ROOT / "temp" / f"{name_model}_{name_phase_b}.step")
-
-    with timer("POSTPROCESS INP"):
-        postprocess_inp(inp_path, out_path, name_model, name_phase_a, name_phase_b, load_case, strain, physical_spacing)
-    exit()
 
     nx, ny, nz = field.shape
     rve = GenericRVE(
@@ -175,8 +174,8 @@ def mesh_3d(
     gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 0)
     gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
     gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 0)
-    gmsh.option.setNumber("Mesh.MeshSizeMin", 0.75 * h)
-    gmsh.option.setNumber("Mesh.MeshSizeMax", 1.25 * h)
+    gmsh.option.setNumber("Mesh.MeshSizeMin", mesh_scale_min * h)
+    gmsh.option.setNumber("Mesh.MeshSizeMax", mesh_scale_max * h)
     f = gmsh.model.mesh.field.add("MathEval")
     gmsh.model.mesh.field.setString(f, "F", str(h))
     gmsh.model.mesh.field.setAsBackgroundMesh(f)

@@ -24,5 +24,27 @@ def plot_contours(field, contours, filepath: str) -> None:
     return None
 
 
+def plot_material_model(replicates, x, y, df_meta, max_strain: float, filepath: str) -> None:
+
+    for name, (x_, y_) in zip(df_meta["Specimen"].values, replicates):
+        fx, fy = zip(*[(xs, ys) for xs, ys in zip(x_, y_) if (xs <= max_strain)])
+        plt.plot(fx, fy, linewidth=1, alpha=0.5, label=name)
+
+    fx, fy = zip(*[(xs, ys) for xs, ys in zip(x, y) if (xs <= max_strain)])
+    plt.plot(fx, fy, linewidth=1.5, color="k", label="Model")
+
+    name = df_meta.iloc[0, -1]
+    plt.title(name)
+    plt.xlabel("Strain (-)")
+    plt.ylabel("Stress (MPa)")
+    plt.ylim(0, 50)
+    plt.grid(alpha=0.5, ls=":")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(filepath, dpi=300)
+    plt.close()
+    return None
+
+
 if __name__ == "__main__":
     exit()

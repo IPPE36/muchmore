@@ -130,20 +130,6 @@ def _bbox(nodes: dict) -> tuple:
     return (min(xs), min(ys), min(zs)), (max(xs), max(ys), max(zs))
 
 
-def _ref_points(rps: list) -> list[str]:
-    """Adds reference points to the Assembly"""
-    out: List[str] = []
-    out.append("** --- reference points (for loads/BCs) ---\n")
-    out.append("*Node\n")
-    for nid, x, y, z, _ in rps:
-        out.append(f"{nid}, {x}, {y}, {z}\n")
-    for nid, _, _, _, name in rps:
-        out.append(f"*Nset, nset={name}\n")
-        out.append(f"{nid},\n")
-    out.append("** --- end reference points ---\n")
-    return out
-
-
 def _parse_nodes(lines) -> dict:
     """Reads an .inp file node table and returns a dict of {index:[x,y,z]}"""
     lines = lines.copy()
@@ -192,7 +178,7 @@ def _parse_elements(lines):
     return elem_conn, elem_type
 
 
-def _pair_coords(nodes, side_minus, side_plus, plane: str, tol=1e-9) -> Tuple[List[int], List[int]]:
+def _pair_coords(nodes, side_plus, side_minus, plane: str, tol=1e-6) -> Tuple[List[int], List[int]]:
     """
     - pair XMIN<->XMAX by matching (y,z)
     - pair YMIN<->YMAX by matching (x,z)
@@ -459,10 +445,10 @@ def postprocess_inp(
     name_model: str = "RVE",
     name_phase_a: str = "PHASE-A",
     name_phase_b: str = "PHASE-B",
-    load_case: Literal["Tensile-X", "Tensile-Y", "Tensile-Z", "Shear-XY", "Shear-XZ", "Shear-YZ"] = "Tensile-X",
+    load_case: Literal["Tensile-X", "Tensile-Y", "Tensile-Z"] = "Tensile-X",
     strain: float = 0.01,
     physical_spacing: float = 1.0,
-    pbc_type: str = "ep",
+    tied: bool = True,
     tol: float = 1e-6,
 ) -> Path:
     """Convert an orphan Abaqus .inp (no *Part/*Assembly) into Part/Assembly. Create periodic boundary conditions.
@@ -551,6 +537,7 @@ def postprocess_inp(
         elem_conn=elem_conn,
         elem_type=elem_type,
     )
+    nids_iface = nids_a_iface.union(nids_b_iface)
 
     # --- section assignments on PART level ---
     out.append("** --- section assignments ---\n")
@@ -565,29 +552,19 @@ def postprocess_inp(
     out.append(f"*Instance, name={name_instance}, part={name_model}\n")
     out.append("*End Instance\n")
 
+    # --- tie surfaces
+    # stiffer matrix = master / assumes PP-PS nomenclature for phases A-B
+    if tied:
+        out.append("*Tie, name=TIE_AB, adjust=NO\n")
+        out.append(f"{name_phase_b}-IF, {name_phase_a}-IF\n")
+
     # --- global bbox ---
     bb_min, bb_max = _bbox(nodes)
     xmin, ymin, zmin = bb_min
     xmax, ymax, zmax = bb_max
-
-    # --- reference points (part level) ---
-    cx = 0.5 * (bb_min[0] + bb_max[0])
-    cy = 0.5 * (bb_min[1] + bb_max[1])
-    cz = 0.5 * (bb_min[2] + bb_max[2])
-    span = max(
-        bb_max[0] - bb_min[0],
-        bb_max[1] - bb_min[1],
-        bb_max[2] - bb_min[2],
-    )
-    off = 0.20 * span  # 20% outward offset
-    max_nid = max(nodes.keys())
-    n = max_nid + 1
-    rps = [
-        (n := n + 1, bb_max[0] + off, cy, cz, "RPX"),
-        (n := n + 1, cx, bb_max[1] + off, cz, "RPY"),
-        (n := n + 1, cx, cy, bb_max[2] + off, "RPZ"),
-    ]
-    out.extend(_ref_points(rps))
+    Lx = bb_max[0] - bb_min[0]
+    Ly = bb_max[1] - bb_min[1]
+    Lz = bb_max[2] - bb_min[2]
 
     used_nsets = set()
 
@@ -597,9 +574,51 @@ def postprocess_inp(
             out.append(f"{nid},\n")
             used_nsets.add(nid)
 
-    bnd_all = {"corners": {}, "edges": {}, "faces": {}}
+    side_names = ["XMIN", "XMAX", "YMIN", "YMAX", "ZMIN", "ZMAX"]
+    side_nodes_all = {k: [] for k in side_names}
+    corner_nodes = {"PMIN": [], "PMAX": []}
+    for n, (x, y, z) in nodes.items():
+        if n in nids_iface:
+            continue
+        if abs(x - xmin) < tol:
+            side_nodes_all["XMIN"].append(n)
+        if abs(x - xmax) < tol:
+            side_nodes_all["XMAX"].append(n)
+        if abs(y - ymin) < tol:
+            side_nodes_all["YMIN"].append(n)
+        if abs(y - ymax) < tol:
+            side_nodes_all["YMAX"].append(n)
+        if abs(z - zmin) < tol:
+            side_nodes_all["ZMIN"].append(n)
+        if abs(z - zmax) < tol:
+            side_nodes_all["ZMAX"].append(n)
+        if abs(x - xmax) < tol and abs(y - ymax) < tol and abs(z - zmax) < tol:
+            corner_nodes["PMAX"].append(n)
+        if abs(x - xmin) < tol and abs(y - ymin) < tol and abs(z - zmin) < tol:
+            corner_nodes["PMIN"].append(n)
+
+    for key in side_nodes_all:
+        side_nodes_all[key] = sorted(side_nodes_all[key])
+
+    # remove PMAX corner from *_MAX faces and PMIN corner from *_MIN faces
+    # but only for the faces that are NOT the loaded axis
+    loaded_axis = {"Tensile-X": "X", "Tensile-Y": "Y", "Tensile-Z": "Z"}[load_case]
+    for ax in ["X", "Y", "Z"]:
+        if ax == loaded_axis:
+            continue
+        side_nodes_all[f"{ax}MAX"] = [n for n in side_nodes_all[f"{ax}MAX"] if n not in corner_nodes["PMAX"]]
+        side_nodes_all[f"{ax}MIN"] = [n for n in side_nodes_all[f"{ax}MIN"] if n not in corner_nodes["PMIN"]]
+
+    out.extend(_format_nset("PMIN", corner_nodes["PMIN"]))
+    out.extend(_format_nset("PMAX", corner_nodes["PMAX"]))
+    out.extend(_format_nset("XMIN", side_nodes_all["XMIN"]))
+    out.extend(_format_nset("XMAX", side_nodes_all["XMAX"]))
+    out.extend(_format_nset("YMIN", side_nodes_all["YMIN"]))
+    out.extend(_format_nset("YMAX", side_nodes_all["YMAX"]))
+    out.extend(_format_nset("ZMIN", side_nodes_all["ZMIN"]))
+    out.extend(_format_nset("ZMAX", side_nodes_all["ZMAX"]))
+
     for phase_, nodes_, nids_if_ in zip([name_phase_b, name_phase_a], [nodes_b, nodes_a], [nids_b_iface, nids_a_iface]):
-        side_names = ["XMIN", "XMAX", "YMIN", "YMAX", "ZMIN", "ZMAX"]
         side_nodes = {k: [] for k in side_names}
 
         for n, (x, y, z) in nodes_.items():
@@ -622,389 +641,83 @@ def postprocess_inp(
             side_nodes[key] = sorted(side_nodes[key])
 
         bnd = _classify_boundary_nodes(side_nodes)
-        for name, n in bnd["corners"].items():
-            if len(n):
-                out.extend(_format_nset(f"{name}", n))
-                if name not in bnd_all["corners"].keys():
-                    bnd_all["corners"][name] = n
-                else:
-                    bnd_all["corners"][name].extend(n)
 
-        for name, n in bnd["edges"].items():
-            if len(n):
-                out.extend(_format_nset(f"{name}-{phase_}", n))
-                if name not in bnd_all["edges"].keys():
-                    bnd_all["edges"][name] = n
-                else:
-                    bnd_all["edges"][name].extend(n)
-
-        for name, n in bnd["faces"].items():
-            if len(n):
-                out.extend(_format_nset(f"{name}-{phase_}", n))
-                if name not in bnd_all["faces"].keys():
-                    bnd_all["faces"][name] = n
-                else:
-                    bnd_all["faces"][name].extend(n)
-
-        # --- pbc face equations ---
-        if pbc_type == "e":
-            P_XMIN, M_XMAX = _pair_coords(nodes_, bnd["faces"]["F_XMIN"], bnd["faces"]["F_XMAX"], "X")
-            P_YMAX, M_YMIN = _pair_coords(nodes_, bnd["faces"]["F_YMAX"], bnd["faces"]["F_YMIN"], "Y")
-            P_ZMAX, M_ZMIN = _pair_coords(nodes_, bnd["faces"]["F_ZMAX"], bnd["faces"]["F_ZMIN"], "Z")
-            faces = [
-                ('ZYX', P_XMIN, M_XMAX),
-                ('XZY', P_YMAX, M_YMIN),
-                ('YXZ', P_ZMAX, M_ZMIN),
-            ]
-            for face in faces:
-                rp, plus_nodes, minus_nodes = face
-                for dof, rp_ in zip([1, 2, 3], rp):
-                    for n_plus, n_minus in zip(plus_nodes, minus_nodes):
-                        add_to_used(n_plus)
-                        add_to_used(n_minus)
-                        out.append(f"*Equation\n3\n")
-                        out.append(f"NS-{n_plus}, {dof},  1.0\n")
-                        out.append(f"NS-{n_minus}, {dof}, -1.0\n")
-                        out.append(f"RP{rp_}, {dof}, -1.0\n")
-
-            P_XMAX_ZMAX1, M_XMIN_ZMAX1 = _pair_coords(nodes_, bnd["edges"]["E_XMAX_ZMAX"], bnd["edges"]["E_XMIN_ZMAX"], "X")
-            P_XMIN_ZMAX2, M_XMIN_ZMIN2 = _pair_coords(nodes_, bnd["edges"]["E_XMIN_ZMAX"], bnd["edges"]["E_XMIN_ZMIN"], "Z")
-            P_XMAX_ZMIN3, M_XMIN_ZMIN3 = _pair_coords(nodes_, bnd["edges"]["E_XMAX_ZMIN"], bnd["edges"]["E_XMIN_ZMIN"], "X")
-            P_YMAX_ZMAX4, M_YMAX_ZMIN4 = _pair_coords(nodes_, bnd["edges"]["E_YMAX_ZMAX"], bnd["edges"]["E_YMAX_ZMIN"], "Z")
-            P_YMAX_ZMIN5, M_YMIN_ZMIN5 = _pair_coords(nodes_, bnd["edges"]["E_YMAX_ZMIN"], bnd["edges"]["E_YMIN_ZMIN"], "Y")
-            P_YMIN_ZMAX6, M_YMIN_ZMIN6 = _pair_coords(nodes_, bnd["edges"]["E_YMIN_ZMAX"], bnd["edges"]["E_YMIN_ZMIN"], "Z")
-            P_XMAX_YMAX7, M_XMIN_YMAX7 = _pair_coords(nodes_, bnd["edges"]["E_XMAX_YMAX"], bnd["edges"]["E_XMIN_YMAX"], "X")
-            P_XMIN_YMAX8, M_XMIN_YMIN8 = _pair_coords(nodes_, bnd["edges"]["E_XMIN_YMAX"], bnd["edges"]["E_XMIN_YMIN"], "Y")
-            P_XMAX_YMIN9, M_XMIN_YMIN9 = _pair_coords(nodes_, bnd["edges"]["E_XMAX_YMIN"], bnd["edges"]["E_XMIN_YMIN"], "X")
-            edges = [
-                ('ZYX', P_XMAX_ZMAX1, M_XMIN_ZMAX1),
-                ('YXZ', P_XMIN_ZMAX2, M_XMIN_ZMIN2),
-                ('ZYX', P_XMAX_ZMIN3, M_XMIN_ZMIN3),
-                ('YXZ', P_YMAX_ZMAX4, M_YMAX_ZMIN4),
-                ('XZY', P_YMAX_ZMIN5, M_YMIN_ZMIN5),
-                ('YXZ', P_YMIN_ZMAX6, M_YMIN_ZMIN6),
-                ('ZYX', P_XMAX_YMAX7, M_XMIN_YMAX7),
-                ('XZY', P_XMIN_YMAX8, M_XMIN_YMIN8),
-                ('ZYX', P_XMAX_YMIN9, M_XMIN_YMIN9),
-            ]
-            for edge in edges:
-                rp, plus_nodes, minus_nodes = edge
-                for dof, rp_ in zip([1, 2, 3], rp):
-                    for n_plus, n_minus in zip(plus_nodes, minus_nodes):
-                        add_to_used(n_plus)
-                        add_to_used(n_minus)
-                        out.append(f"*Equation\n3\n")
-                        out.append(f"NS-{n_plus}, {dof},  1.0\n")
-                        out.append(f"NS-{n_minus}, {dof}, -1.0\n")
-                        out.append(f"RP{rp_}, {dof}, -1.0\n")
-
-        elif pbc_type == "ep":
-            P_XMIN, M_XMAX = _pair_coords(nodes_, bnd["faces"]["F_XMIN"], bnd["faces"]["F_XMAX"], "X")
-            P_YMAX, M_YMIN = _pair_coords(nodes_, bnd["faces"]["F_YMAX"], bnd["faces"]["F_YMIN"], "Y")
-            P_ZMAX, M_ZMIN = _pair_coords(nodes_, bnd["faces"]["F_ZMAX"], bnd["faces"]["F_ZMIN"], "Z")
-            faces = [
-                ('13', P_XMIN, M_XMAX),
-                ('23', P_YMAX, M_YMIN),
-                ('12', P_ZMAX, M_ZMIN),
-            ]
-            for face in faces:
-                dofs, plus_nodes, minus_nodes = face
-                for dof in dofs:
-                    for n_plus, n_minus in zip(plus_nodes, minus_nodes):
-                        add_to_used(n_plus)
-                        add_to_used(n_minus)
-                        out.append(f"*Equation\n2\n")
-                        out.append(f"NS-{n_plus}, {dof},  1.0\n")
-                        out.append(f"NS-{n_minus}, {dof}, -1.0\n")
-
-            P_XMAX_ZMAX1, M_XMIN_ZMAX1 = _pair_coords(nodes_, bnd["edges"]["E_XMAX_ZMAX"], bnd["edges"]["E_XMIN_ZMAX"], "X")
-            P_XMAX_ZMIN2, M_XMIN_ZMIN2 = _pair_coords(nodes_, bnd["edges"]["E_XMAX_ZMIN"], bnd["edges"]["E_XMIN_ZMIN"], "X")
-            P_XMIN_ZMAX3, M_XMIN_ZMIN3 = _pair_coords(nodes_, bnd["edges"]["E_XMIN_ZMAX"], bnd["edges"]["E_XMIN_ZMIN"], "Z")
-            P_YMAX_ZMAX4, M_YMAX_ZMIN4 = _pair_coords(nodes_, bnd["edges"]["E_YMAX_ZMAX"], bnd["edges"]["E_YMAX_ZMIN"], "Z")
-            P_YMIN_ZMAX5, M_YMIN_ZMIN5 = _pair_coords(nodes_, bnd["edges"]["E_YMIN_ZMAX"], bnd["edges"]["E_YMIN_ZMIN"], "Z")
-            P_YMAX_ZMIN6, M_YMIN_ZMIN6 = _pair_coords(nodes_, bnd["edges"]["E_YMAX_ZMIN"], bnd["edges"]["E_YMIN_ZMIN"], "Y")
-            P_XMAX_YMAX7, M_XMIN_YMAX7 = _pair_coords(nodes_, bnd["edges"]["E_XMAX_YMAX"], bnd["edges"]["E_XMIN_YMAX"], "X")
-            P_XMAX_YMIN8, M_XMIN_YMIN8 = _pair_coords(nodes_, bnd["edges"]["E_XMAX_YMIN"], bnd["edges"]["E_XMIN_YMIN"], "X")
-            P_XMIN_YMAX9, M_XMIN_YMIN9 = _pair_coords(nodes_, bnd["edges"]["E_XMIN_YMAX"], bnd["edges"]["E_XMIN_YMIN"], "Y")
-
-            edges = [
-                ('2', P_XMAX_ZMAX1, M_XMIN_ZMAX1),
-                ('2', P_XMAX_ZMIN2, M_XMIN_ZMIN2),
-                ('2', P_XMIN_ZMAX3, M_XMIN_ZMIN3),
-                ('1', P_YMAX_ZMAX4, M_YMAX_ZMIN4),
-                ('1', P_YMIN_ZMAX5, M_YMIN_ZMIN5),
-                ('1', P_YMAX_ZMIN6, M_YMIN_ZMIN6),
-                ('3', P_XMAX_YMAX7, M_XMIN_YMAX7),
-                ('3', P_XMAX_YMIN8, M_XMIN_YMIN8),
-                ('3', P_XMIN_YMAX9, M_XMIN_YMIN9),
-            ]
-            for edge in edges:
-                dofs, plus_nodes, minus_nodes = edge
-                for dof in dofs:
-                    for n_plus, n_minus in zip(plus_nodes, minus_nodes):
-                        add_to_used(n_plus)
-                        add_to_used(n_minus)
-                        out.append(f"*Equation\n2\n")
-                        out.append(f"NS-{n_plus}, {dof},  1.0\n")
-                        out.append(f"NS-{n_minus}, {dof}, -1.0\n")
-        else:
-            raise NotImplementedError
-
-    # --- pbc corner equations ---
-    if pbc_type == "e":
-        corners = [
-            ('YXZ', 'C_XMIN_YMAX_ZMAX', 'C_XMIN_YMAX_ZMIN'),
-            ('ZYX', 'C_XMAX_YMAX_ZMIN', 'C_XMIN_YMAX_ZMIN'),
-            ('YXZ', 'C_XMAX_YMAX_ZMAX', 'C_XMAX_YMAX_ZMIN'),
-            ('ZYX', 'C_XMAX_YMIN_ZMAX', 'C_XMIN_YMIN_ZMAX'),
-            ('YXZ', 'C_XMIN_YMIN_ZMAX', 'C_XMIN_YMIN_ZMIN'),
-            ('ZYX', 'C_XMAX_YMIN_ZMIN', 'C_XMIN_YMIN_ZMIN'),
-            ('XZY', 'C_XMIN_YMAX_ZMIN', 'C_XMIN_YMIN_ZMIN'),
+        P_XMIN, M_XMAX = _pair_coords(nodes_, bnd["faces"]["F_XMIN"], bnd["faces"]["F_XMAX"], "X")
+        P_YMAX, M_YMIN = _pair_coords(nodes_, bnd["faces"]["F_YMAX"], bnd["faces"]["F_YMIN"], "Y")
+        P_ZMAX, M_ZMIN = _pair_coords(nodes_, bnd["faces"]["F_ZMAX"], bnd["faces"]["F_ZMIN"], "Z")
+        faces = [
+            ('13', P_YMAX, M_YMIN),
+            ('23', P_XMIN, M_XMAX),
+            ('12', P_ZMAX, M_ZMIN),
         ]
-        for c in corners:
-            rp, plus_set, minus_set = c
-            for dof, rp_ in zip([1, 2, 3], rp):
-                out.append(f"*Equation\n3\n")
-                out.append(f"{plus_set}, {dof},  1.0\n")
-                out.append(f"{minus_set}, {dof}, -1.0\n")
-                out.append(f"RP{rp_}, {dof}, -1.0\n")
+        for face in faces:
+            dofs, plus_nodes, minus_nodes = face
+            for dof in dofs:
+                for n_plus, n_minus in zip(plus_nodes, minus_nodes):
+                    add_to_used(n_plus)
+                    add_to_used(n_minus)
+                    out.append(f"*Equation\n2\n")
+                    out.append(f"NS-{n_plus}, {dof},  1.0\n")
+                    out.append(f"NS-{n_minus}, {dof}, -1.0\n")
 
-    elif pbc_type == "ep":
-        out.append(f"*Equation\n2\n")  # BRP1
-        out.append(f"C_XMAX_YMAX_ZMAX, 1, 1.0\n")
-        out.append(f"RPX, 1, -1.0\n")
-        out.append(f"*Equation\n2\n")  # C
-        out.append(f"C_XMAX_YMAX_ZMAX, 1, 1.0\n")
-        out.append(f"C_XMAX_YMAX_ZMIN, 1, -1.0\n")
-        out.append(f"*Equation\n2\n")  # B'
-        out.append(f"C_XMAX_YMAX_ZMAX, 1, 1.0\n")
-        out.append(f"C_XMAX_YMIN_ZMAX, 1, -1.0\n")
-        out.append(f"*Equation\n2\n")  # C'
-        out.append(f"C_XMAX_YMAX_ZMAX, 1, 1.0\n")
-        out.append(f"C_XMAX_YMIN_ZMIN, 1, -1.0\n")
+        P_XMAX_ZMAX1, M_XMIN_ZMAX1 = _pair_coords(nodes_, bnd["edges"]["E_XMAX_ZMAX"], bnd["edges"]["E_XMIN_ZMAX"], "X")
+        P_XMAX_ZMIN2, M_XMIN_ZMIN2 = _pair_coords(nodes_, bnd["edges"]["E_XMAX_ZMIN"], bnd["edges"]["E_XMIN_ZMIN"], "X")
+        P_XMIN_ZMAX3, M_XMIN_ZMIN3 = _pair_coords(nodes_, bnd["edges"]["E_XMIN_ZMAX"], bnd["edges"]["E_XMIN_ZMIN"], "Z")
+        P_YMAX_ZMAX4, M_YMAX_ZMIN4 = _pair_coords(nodes_, bnd["edges"]["E_YMAX_ZMAX"], bnd["edges"]["E_YMAX_ZMIN"], "Z")
+        P_YMIN_ZMAX5, M_YMIN_ZMIN5 = _pair_coords(nodes_, bnd["edges"]["E_YMIN_ZMAX"], bnd["edges"]["E_YMIN_ZMIN"], "Z")
+        P_YMAX_ZMIN6, M_YMIN_ZMIN6 = _pair_coords(nodes_, bnd["edges"]["E_YMAX_ZMIN"], bnd["edges"]["E_YMIN_ZMIN"], "Y")
+        P_XMAX_YMAX7, M_XMIN_YMAX7 = _pair_coords(nodes_, bnd["edges"]["E_XMAX_YMAX"], bnd["edges"]["E_XMIN_YMAX"], "X")
+        P_XMAX_YMIN8, M_XMIN_YMIN8 = _pair_coords(nodes_, bnd["edges"]["E_XMAX_YMIN"], bnd["edges"]["E_XMIN_YMIN"], "X")
+        P_XMIN_YMAX9, M_XMIN_YMIN9 = _pair_coords(nodes_, bnd["edges"]["E_XMIN_YMAX"], bnd["edges"]["E_XMIN_YMIN"], "Y")
 
-        for nid_ in bnd_all["edges"]["E_XMAX_YMAX"]:  # BC
-            out.append(f"*Equation\n2\n")
-            out.append(f"C_XMAX_YMAX_ZMAX, 1, 1.0\n")
-            out.append(f"NS-{nid_}, 1, -1.0\n")
+        edges = [
+            ('2', P_XMAX_ZMAX1, M_XMIN_ZMAX1),
+            ('2', P_XMAX_ZMIN2, M_XMIN_ZMIN2),
+            ('2', P_XMIN_ZMAX3, M_XMIN_ZMIN3),
+            ('1', P_YMAX_ZMAX4, M_YMAX_ZMIN4),
+            ('1', P_YMIN_ZMAX5, M_YMIN_ZMIN5),
+            ('1', P_YMAX_ZMIN6, M_YMIN_ZMIN6),
+            ('3', P_XMAX_YMAX7, M_XMIN_YMAX7),
+            ('3', P_XMAX_YMIN8, M_XMIN_YMIN8),
+            ('3', P_XMIN_YMAX9, M_XMIN_YMIN9),
+        ]
+        for edge in edges:
+            dofs, plus_nodes, minus_nodes = edge
+            for dof in dofs:
+                for n_plus, n_minus in zip(plus_nodes, minus_nodes):
+                    add_to_used(n_plus)
+                    add_to_used(n_minus)
+                    out.append(f"*Equation\n2\n")
+                    out.append(f"NS-{n_plus}, {dof},  1.0\n")
+                    out.append(f"NS-{n_minus}, {dof}, -1.0\n")
 
-        for nid_ in bnd_all["edges"]["E_XMAX_ZMAX"]:  # BB'
-            out.append(f"*Equation\n2\n")
-            out.append(f"C_XMAX_YMAX_ZMAX, 1, 1.0\n")
-            out.append(f"NS-{nid_}, 1, -1.0\n")
-
-        for nid_ in bnd_all["edges"]["E_XMAX_YMIN"]:  # B'C'
-            out.append(f"*Equation\n2\n")
-            out.append(f"C_XMAX_YMAX_ZMAX, 1, 1.0\n")
-            out.append(f"NS-{nid_}, 1, -1.0\n")
-
-        for nid_ in bnd_all["edges"]["E_XMAX_ZMIN"]:  # CC'
-            out.append(f"*Equation\n2\n")
-            out.append(f"C_XMAX_YMAX_ZMAX, 1, 1.0\n")
-            out.append(f"NS-{nid_}, 1, -1.0\n")
-
-        for nid_ in bnd_all["faces"]["F_XMIN"]:  # Right
-            out.append(f"*Equation\n2\n")
-            out.append(f"C_XMAX_YMAX_ZMAX, 1, 1.0\n")
-            out.append(f"NS-{nid_}, 1, -1.0\n")
-
-        ####################################################
-        out.append(f"*Equation\n2\n")  # ARP2
-        out.append(f"C_XMIN_YMAX_ZMAX, 1, 1.0\n")
-        out.append(f"RPY, 1, -1.0\n")
-        out.append(f"*Equation\n2\n")  # D
-        out.append(f"C_XMIN_YMAX_ZMAX, 1, 1.0\n")
-        out.append(f"C_XMIN_YMAX_ZMIN, 1, -1.0\n")
-        out.append(f"*Equation\n2\n")  # A'
-        out.append(f"C_XMIN_YMAX_ZMAX, 1, 1.0\n")
-        out.append(f"C_XMIN_YMIN_ZMAX, 1, -1.0\n")
-        out.append(f"*Equation\n2\n")  # D'
-        out.append(f"C_XMIN_YMAX_ZMAX, 1, 1.0\n")
-        out.append(f"C_XMIN_YMIN_ZMIN, 1, -1.0\n")
-
-        for nid_ in bnd_all["edges"]["E_XMIN_YMAX"]:  # AD
-            out.append(f"*Equation\n2\n")
-            out.append(f"C_XMIN_YMAX_ZMAX, 1, 1.0\n")
-            out.append(f"NS-{nid_}, 1, -1.0\n")
-
-        for nid_ in bnd_all["edges"]["E_XMIN_YMIN"]:  # A'D'
-            out.append(f"*Equation\n2\n")
-            out.append(f"C_XMIN_YMAX_ZMAX, 1, 1.0\n")
-            out.append(f"NS-{nid_}, 1, -1.0\n")
-
-        for nid_ in bnd_all["edges"]["E_XMIN_ZMAX"]:  # AA'
-            out.append(f"*Equation\n2\n")
-            out.append(f"C_XMIN_YMAX_ZMAX, 1, 1.0\n")
-            out.append(f"NS-{nid_}, 1, -1.0\n")
-
-        for nid_ in bnd_all["edges"]["E_XMIN_ZMIN"]:  # DD'
-            out.append(f"*Equation\n2\n")
-            out.append(f"C_XMIN_YMAX_ZMAX, 1, 1.0\n")
-            out.append(f"NS-{nid_}, 1, -1.0\n")
-
-        for nid_ in bnd_all["faces"]["F_XMAX"]:  # Left
-            out.append(f"*Equation\n2\n")
-            out.append(f"C_XMIN_YMAX_ZMAX, 1, 1.0\n")
-            out.append(f"NS-{nid_}, 1, -1.0\n")
-
-        ####################################################
-        out.append(f"*Equation\n2\n")  # ARP1
-        out.append(f"C_XMIN_YMAX_ZMAX, 3, 1.0\n")
-        out.append(f"RPX, 1, -1.0\n")
-        out.append(f"*Equation\n2\n")  # B
-        out.append(f"C_XMIN_YMAX_ZMAX, 3, 1.0\n")
-        out.append(f"C_XMAX_YMAX_ZMAX, 3, -1.0\n")
-        out.append(f"*Equation\n2\n")  # A'
-        out.append(f"C_XMIN_YMAX_ZMAX, 3, 1.0\n")
-        out.append(f"C_XMIN_YMIN_ZMAX, 3, -1.0\n")
-        out.append(f"*Equation\n2\n")  # B'
-        out.append(f"C_XMIN_YMAX_ZMAX, 3, 1.0\n")
-        out.append(f"C_XMAX_YMIN_ZMAX, 3, -1.0\n")
-
-        for nid_ in bnd_all["edges"]["E_YMAX_ZMAX"]:  # AB
-            out.append(f"*Equation\n2\n")
-            out.append(f"C_XMIN_YMAX_ZMAX, 3, 1.0\n")
-            out.append(f"NS-{nid_}, 3, -1.0\n")
-
-        for nid_ in bnd_all["edges"]["E_YMIN_ZMAX"]:  # A'B'
-            out.append(f"*Equation\n2\n")
-            out.append(f"C_XMIN_YMAX_ZMAX, 3, 1.0\n")
-            out.append(f"NS-{nid_}, 3, -1.0\n")
-
-        for nid_ in bnd_all["edges"]["E_XMIN_ZMAX"]:  # AA'
-            out.append(f"*Equation\n2\n")
-            out.append(f"C_XMIN_YMAX_ZMAX, 3, 1.0\n")
-            out.append(f"NS-{nid_}, 3, -1.0\n")
-
-        for nid_ in bnd_all["edges"]["E_XMAX_ZMAX"]:  # BB'
-            out.append(f"*Equation\n2\n")
-            out.append(f"C_XMIN_YMAX_ZMAX, 3, 1.0\n")
-            out.append(f"NS-{nid_}, 3, -1.0\n")
-
-        for nid_ in bnd_all["faces"]["F_ZMAX"]:  # Front
-            out.append(f"*Equation\n2\n")
-            out.append(f"C_XMIN_YMAX_ZMAX, 3, 1.0\n")
-            out.append(f"NS-{nid_}, 3, -1.0\n")
-
-        ####################################################
-        out.append(f"*Equation\n2\n")  # CRP2
-        out.append(f"C_XMAX_YMAX_ZMIN, 3, 1.0\n")
-        out.append(f"RPY, 1, -1.0\n")
-        out.append(f"*Equation\n2\n")  # D
-        out.append(f"C_XMAX_YMAX_ZMIN, 3, 1.0\n")
-        out.append(f"C_XMIN_YMAX_ZMIN, 3, -1.0\n")
-        out.append(f"*Equation\n2\n")  # C'
-        out.append(f"C_XMAX_YMAX_ZMIN, 3, 1.0\n")
-        out.append(f"C_XMAX_YMIN_ZMIN, 3, -1.0\n")
-        out.append(f"*Equation\n2\n")  # D'
-        out.append(f"C_XMAX_YMAX_ZMIN, 3, 1.0\n")
-        out.append(f"C_XMIN_YMIN_ZMIN, 3, -1.0\n")
-
-        for nid_ in bnd_all["edges"]["E_XMAX_ZMIN"]:  # CC'
-            out.append(f"*Equation\n2\n")
-            out.append(f"C_XMAX_YMAX_ZMIN, 3, 1.0\n")
-            out.append(f"NS-{nid_}, 3, -1.0\n")
-
-        for nid_ in bnd_all["edges"]["E_XMIN_ZMIN"]:  # DD'
-            out.append(f"*Equation\n2\n")
-            out.append(f"C_XMAX_YMAX_ZMIN, 3, 1.0\n")
-            out.append(f"NS-{nid_}, 3, -1.0\n")
-
-        for nid_ in bnd_all["edges"]["E_YMAX_ZMIN"]:  # CD
-            out.append(f"*Equation\n2\n")
-            out.append(f"C_XMAX_YMAX_ZMIN, 3, 1.0\n")
-            out.append(f"NS-{nid_}, 3, -1.0\n")
-
-        for nid_ in bnd_all["edges"]["E_YMIN_ZMIN"]:  # C'D'
-            out.append(f"*Equation\n2\n")
-            out.append(f"C_XMAX_YMAX_ZMIN, 3, 1.0\n")
-            out.append(f"NS-{nid_}, 3, -1.0\n")
-
-        for nid_ in bnd_all["faces"]["F_ZMAX"]:  # Front
-            out.append(f"*Equation\n2\n")
-            out.append(f"C_XMAX_YMAX_ZMIN, 3, 1.0\n")
-            out.append(f"NS-{nid_}, 3, -1.0\n")
-
-        ####################################################
-        out.append(f"*Equation\n2\n")  # ARP1
-        out.append(f"C_XMIN_YMAX_ZMAX, 2, 1.0\n")
-        out.append(f"RPX, 1, -1.0\n")
-        out.append(f"*Equation\n2\n")  # B
-        out.append(f"C_XMIN_YMAX_ZMAX, 2, 1.0\n")
-        out.append(f"C_XMAX_YMAX_ZMAX, 2, -1.0\n")
-        out.append(f"*Equation\n2\n")  # C
-        out.append(f"C_XMIN_YMAX_ZMAX, 2, 1.0\n")
-        out.append(f"C_XMAX_YMAX_ZMIN, 2, -1.0\n")
-        out.append(f"*Equation\n2\n")  # D
-        out.append(f"C_XMIN_YMAX_ZMAX, 2, 1.0\n")
-        out.append(f"C_XMIN_YMAX_ZMIN, 2, -1.0\n")
-
-        for nid_ in bnd_all["edges"]["E_YMAX_ZMAX"]:  # AB
-            out.append(f"*Equation\n2\n")
-            out.append(f"C_XMAX_YMAX_ZMIN, 2, 1.0\n")
-            out.append(f"NS-{nid_}, 2, -1.0\n")
-
-        for nid_ in bnd_all["edges"]["E_XMAX_YMAX"]:  # BC
-            out.append(f"*Equation\n2\n")
-            out.append(f"C_XMAX_YMAX_ZMIN, 2, 1.0\n")
-            out.append(f"NS-{nid_}, 2, -1.0\n")
-
-        for nid_ in bnd_all["edges"]["E_YMAX_ZMIN"]:  # CD
-            out.append(f"*Equation\n2\n")
-            out.append(f"C_XMAX_YMAX_ZMIN, 2, 1.0\n")
-            out.append(f"NS-{nid_}, 2, -1.0\n")
-
-        for nid_ in bnd_all["edges"]["E_XMIN_YMAX"]:  # AD
-            out.append(f"*Equation\n2\n")
-            out.append(f"C_XMAX_YMAX_ZMIN, 2, 1.0\n")
-            out.append(f"NS-{nid_}, 2, -1.0\n")
-
-        for nid_ in bnd_all["faces"]["F_YMAX"]:  # Top
-            out.append(f"*Equation\n2\n")
-            out.append(f"C_XMAX_YMAX_ZMIN, 2, 1.0\n")
-            out.append(f"NS-{nid_}, 2, -1.0\n")
-
-        ####################################################
-        out.append(f"*Equation\n2\n")  # A'RP2
-        out.append(f"C_XMIN_YMIN_ZMAX, 2, 1.0\n")
-        out.append(f"RPY, 1, -1.0\n")
-        out.append(f"*Equation\n2\n")  # B'
-        out.append(f"C_XMIN_YMIN_ZMAX, 2, 1.0\n")
-        out.append(f"C_XMAX_YMIN_ZMAX, 2, -1.0\n")
-        out.append(f"*Equation\n2\n")  # C'
-        out.append(f"C_XMIN_YMIN_ZMAX, 2, 1.0\n")
-        out.append(f"C_XMAX_YMIN_ZMIN, 2, -1.0\n")
-        out.append(f"*Equation\n2\n")  # D'
-        out.append(f"C_XMIN_YMIN_ZMAX, 2, 1.0\n")
-        out.append(f"C_XMIN_YMIN_ZMIN, 2, -1.0\n")
-
-        for nid_ in bnd_all["edges"]["E_YMIN_ZMAX"]:  # A'B'
-            out.append(f"*Equation\n2\n")
-            out.append(f"C_XMIN_YMIN_ZMAX, 2, 1.0\n")
-            out.append(f"NS-{nid_}, 2, -1.0\n")
-
-        for nid_ in bnd_all["edges"]["E_XMAX_YMIN"]:  # B'C'
-            out.append(f"*Equation\n2\n")
-            out.append(f"C_XMIN_YMIN_ZMAX, 2, 1.0\n")
-            out.append(f"NS-{nid_}, 2, -1.0\n")
-
-        for nid_ in bnd_all["edges"]["E_YMIN_ZMIN"]:  # C'D'
-            out.append(f"*Equation\n2\n")
-            out.append(f"C_XMIN_YMIN_ZMAX, 2, 1.0\n")
-            out.append(f"NS-{nid_}, 2, -1.0\n")
-
-        for nid_ in bnd_all["edges"]["E_XMIN_YMIN"]:  # A'D'
-            out.append(f"*Equation\n2\n")
-            out.append(f"C_XMIN_YMIN_ZMAX, 2, 1.0\n")
-            out.append(f"NS-{nid_}, 2, -1.0\n")
-
-        for nid_ in bnd_all["faces"]["F_YMIN"]:  # Bottom
-            out.append(f"*Equation\n2\n")
-            out.append(f"C_XMIN_YMIN_ZMAX, 2, 1.0\n")
-            out.append(f"NS-{nid_}, 2, -1.0\n")
-
+    if load_case == "Tensile-X":
+        couple_dofs = [2, 3]  # tie Y & Z to PMIN/PMAX
+    elif load_case == "Tensile-Y":
+        couple_dofs = [1, 3]  # tie X & Z to PMIN/PMAX
+    elif load_case == "Tensile-Z":
+        couple_dofs = [1, 2]  # tie X & Y to PMIN/PMAX
     else:
-        raise NotImplementedError
+        couple_dofs = []
+
+    def couple_face_to_corner(face_key, corner_set, dof):
+        for nid_ in side_nodes_all[face_key]:
+            add_to_used(nid_)
+            out.append("*Equation\n2\n")
+            out.append(f"NS-{nid_}, {dof},  1.0\n")
+            out.append(f"{corner_set}, {dof}, -1.0\n")
+
+    if 1 in couple_dofs:
+        couple_face_to_corner("XMAX", "PMAX", 1)
+        couple_face_to_corner("XMIN", "PMIN", 1)
+
+    if 2 in couple_dofs:
+        couple_face_to_corner("YMAX", "PMAX", 2)
+        couple_face_to_corner("YMIN", "PMIN", 2)
+
+    if 3 in couple_dofs:
+        couple_face_to_corner("ZMAX", "PMAX", 3)
+        couple_face_to_corner("ZMIN", "PMIN", 3)
 
     out.append("*End Assembly\n\n")
 
@@ -1023,91 +736,14 @@ def postprocess_inp(
     out.append("** --- end materials ---\n")
 
     # --- boundary conditions ---
-    shear_split = 0.5
-    if pbc_type == "ep":
-        bc = [
-            ("RPX", 1, 0),
-            ("RPY", 1, strain * (bb_max[0] - bb_min[0])),
-        ]
+    if load_case == "Tensile-X":
+        bc = [("XMIN", 1, 0.0), ("XMAX", 1, strain * Lx)]
+    elif load_case == "Tensile-Y":
+        bc = [("YMIN", 2, 0.0), ("YMAX", 2, strain * Ly)]
+    elif load_case == "Tensile-Z":
+        bc = [("ZMIN", 3, 0.0), ("ZMAX", 3, strain * Lz)]
     else:
-        if load_case == "Tensile-X":
-            bc = [
-                ("RPZ", 1, strain * (bb_max[0] - bb_min[0])),
-                ("RPZ", 2, 0),
-                ("RPZ", 3, 0),
-                ("RPX", 1, 0),
-                ("RPX", 2, 0),
-                ("RPX", 3, 0),
-                ("RPY", 1, 0),
-                ("RPY", 2, 0),
-                ("RPY", 3, 0),
-            ]
-        elif load_case == "Tensile-Y":
-            bc = [
-                ("RPZ", 1, 0),
-                ("RPZ", 2, strain * (bb_max[1] - bb_min[1])),
-                ("RPZ", 3, 0),
-                ("RPX", 1, 0),
-                ("RPX", 2, 0),
-                ("RPX", 3, 0),
-                ("RPY", 1, 0),
-                ("RPY", 2, 0),
-                ("RPY", 3, 0),
-            ]
-
-        elif load_case == "Tensile-Z":
-            bc = [
-                ("RPZ", 1, 0),
-                ("RPZ", 2, 0),
-                ("RPZ", 3, strain * (bb_max[2] - bb_min[2])),
-                ("RPX", 1, 0),
-                ("RPX", 2, 0),
-                ("RPX", 3, 0),
-                ("RPY", 1, 0),
-                ("RPY", 2, 0),
-                ("RPY", 3, 0),
-            ]
-        elif load_case == "Shear-XY":
-            gamma = strain
-            bc = [
-                ("RPX", 1, gamma * (bb_max[0] - bb_min[0]) * shear_split),
-                ("RPX", 2, 0),
-                ("RPX", 3, 0),
-                ("RPY", 1, 0),
-                ("RPY", 2, gamma * (bb_max[1] - bb_min[1]) * shear_split),
-                ("RPY", 3, 0),
-                ("RPZ", 1, 0),
-                ("RPZ", 2, 0),
-                ("RPZ", 3, 0),
-            ]
-        elif load_case == "Shear-XZ":
-            gamma = strain
-            bc = [
-                ("RPX", 1, 0),
-                ("RPX", 2, 0),
-                ("RPX", 3, gamma * (bb_max[2] - bb_min[2]) * shear_split),
-                ("RPY", 1, gamma * (bb_max[0] - bb_min[0]) * shear_split),
-                ("RPY", 2, 0),
-                ("RPY", 3, 0),
-                ("RPZ", 1, 0),
-                ("RPZ", 2, 0),
-                ("RPZ", 3, 0),
-            ]
-        elif load_case == "Shear-YZ":
-            gamma = strain
-            bc = [
-                ("RPX", 1, 0),
-                ("RPX", 2, gamma * (bb_max[1] - bb_min[1]) * shear_split),
-                ("RPX", 3, 0),
-                ("RPY", 1, 0),
-                ("RPY", 2, 0),
-                ("RPY", 3, gamma * (bb_max[2] - bb_min[2]) * shear_split),
-                ("RPZ", 1, 0),
-                ("RPZ", 2, 0),
-                ("RPZ", 3, 0),
-            ]
-        else:
-            raise ValueError(f"Unknown load_case: {load_case}")
+        raise ValueError(f"Unsupported load_case: {load_case}")
 
     # --- stepping ---
     out.append("** --- step & output ---\n")
@@ -1115,14 +751,16 @@ def postprocess_inp(
     out.append("*Static\n")
     out.append("0.1, 1., 1e-08, 0.1\n")
     out.append("*Boundary\n")
+    out.append("PMIN, 1, 3, 0.0\n")
     for rp, dof, val in bc:
         out.append(f"{rp}, {dof}, {dof}, {val}\n")
 
     # --- FIELD OUTPUT ---
-    out.append("*Output, field, frequency=20\n")
+    out.append("*Restart, write, frequency=0\n")
+    out.append("*Output, field, time interval=0.1, time marks=NO\n")
     out.append("*Node Output\n")
     out.append("U\n")
-    out.append("*Element Output\n")
+    out.append("*Element Output, directions=YES\n")
     out.append("S, LE, PE, PEEQ, STATUS, EVOL\n")
     out.append("*Contact Output\n")
     out.append("CSTRESS, CDISP, CSTATUS\n")
@@ -1131,12 +769,6 @@ def postprocess_inp(
     out.append("*Output, history, frequency=1\n")
     out.append("*Energy Output\n")
     out.append("ALLIE, ALLSE, ALLWK, ALLPD, ALLDMD, ALLCD, ETOTAL\n")
-    out.append("*Node Output, nset=RPX\n")
-    out.append("U, RF\n")
-    out.append("*Node Output, nset=RPY\n")
-    out.append("U, RF\n")
-    out.append("*Node Output, nset=RPZ\n")
-    out.append("U, RF\n")
     out.append("** --- end step & output ---\n")
 
     Path(out_path).write_text("".join(out), encoding="utf-8")
