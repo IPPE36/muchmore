@@ -103,18 +103,19 @@ def chord_length(field: np.ndarray) -> tuple:
     return np.mean(chord_lengths)
 
 
-def volume_fractions(x: np.ndarray) -> list:
+def volume_fractions(field: np.ndarray) -> list:
     """Calculates volume fraction of inclusions of segmented image"""
-    values, counts = np.unique(x, return_counts=True)
-    return [c / x.size for c in counts]
+    values, counts = np.unique(field, return_counts=True)
+    return [c / field.size for c in counts]
 
 
-def particle_features(x: np.ndarray, min_size: int = None) -> ParticleStats:
-    min_size = 25 if not min_size else min_size
-    mask, n = label(x)
+def particle_features(field: np.ndarray, min_size: int = None, inclusion_value: int = 1) -> ParticleStats:
+    min_size = field.size // 400 if not min_size else min_size
+    mask, n = label(field == inclusion_value)
 
     centers, area, aspect_ratio, radius = [], [], [], []
     n_particles = 0
+    n_particles_border = 0
 
     for i in range(n):
         points = np.array(np.where(mask == i + 1))
@@ -122,21 +123,22 @@ def particle_features(x: np.ndarray, min_size: int = None) -> ParticleStats:
         if points.shape[-1] < min_size:
             continue
 
-        n_particles += 1
         s = points.shape[-1]
         area.append(s)
+        n_particles += 1
 
         # --- skip particles touching the border ---
         touches_border = False
-        for d in range(x.ndim):
+        for d in range(field.ndim):
             if (
                     np.any(points[d] == 0) or
-                    np.any(points[d] == x.shape[d] - 1)
+                    np.any(points[d] == field.shape[d] - 1)
             ):
                 touches_border = True
                 break
 
         if touches_border:
+            n_particles_border += 1
             continue
         # ------------------------------------------
 
@@ -148,9 +150,9 @@ def particle_features(x: np.ndarray, min_size: int = None) -> ParticleStats:
             continue
 
         # representative (equivalent) radius
-        if x.ndim == 2:
+        if field.ndim == 2:
             r = np.sqrt(s / np.pi)
-        elif x.ndim == 3:
+        elif field.ndim == 3:
             r = (3 * s / (4 * np.pi)) ** (1 / 3)
 
         aspect_ratio.append(ar)
@@ -159,17 +161,15 @@ def particle_features(x: np.ndarray, min_size: int = None) -> ParticleStats:
 
     center_coords = np.array(centers)
     tree = cKDTree(center_coords)
-    dists = tree.query(center_coords, x.ndim)
+    dists = tree.query(center_coords, field.ndim)
 
     return ParticleStats(
-        n_particles=n_particles,
+        n_particles=n_particles - n_particles_border // 2,
         distance=dists[0][:, 1],
         area=area,
         aspect_ratio=aspect_ratio,
         radius=radius,
     )
-
-
 
 
 if __name__ == "__main__":

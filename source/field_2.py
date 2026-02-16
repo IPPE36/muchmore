@@ -262,51 +262,25 @@ def generate_inclusion_voxels(
     mean_particle_area_um2: float,
     mean_particle_aspect_ratio: float,
     target_vf: float = None,
-    size_factors=None,              # sequence of length n_particles, relative sizes
-    size_factors_are_relative: bool = True,  # if False, interpreted as absolute areas/volumes in um^2/um^3
+    size_factors=None,                   # sequence of length n_particles, relative sizes
+    size_factors_are_relative: bool = True,
     max_attempts: int = 200000,
     minreldistbound: float = 0.00,
-    minreldistincl: float = 0.03,
+    minreldistincl: float = 0.15,
     periodic: bool = True,
     seed: int = None,
     dtype=np.uint8,
+    initial_alpha: float = 0.70,         # place shrunken, then inflate
+    inflate_steps: int = 25,
+    inflate_sweeps: int = 30,
+    inflate_reff_mode: str = "vol",      # "vol" (more permissive) or "rms" (safer)
 ):
     """
     Generate a binary ndarray with randomly placed *ellipsoidal* inclusions.
     Output: array with 1=inclusion phase, 0=matrix.
 
-    NEW:
-      - Optional per-particle sizing via `size_factors`
-      - Optional enforcement of a target area/volume fraction via `target_vf`
-
-    Parameters
-    ----------
-    mean_particle_area_um2:
-        Backward-compatible default size:
-          - ndim=2: mean AREA [µm²]
-          - ndim=3: mean VOLUME [µm³] (name kept)
-
-    target_vf:
-        If provided, scales particle areas/volumes so the requested inclusion
-        fraction is achieved (subject to RSA packing feasibility).
-          - ndim=2: target area fraction
-          - ndim=3: target volume fraction
-
-    size_factors:
-        If provided:
-          - If size_factors_are_relative=True (default): treated as relative weights.
-            Areas/volumes are assigned proportional to these weights.
-          - If False: treated as absolute per-particle areas (2D) or volumes (3D),
-            in µm² / µm³ respectively.
-
-        If size_factors is None:
-          - all particles identical (based on mean_particle_area_um2), unless target_vf
-            is provided, in which case all particles are equal-sized but scaled to match target_vf.
-
-    Returns
-    -------
-    mask : ndarray of shape box_size_vox (ndim), values {0,1}
-    info : dict with placed centers/axes (in microns) and voxel size
+    In 3D: places shrunken particles (initial_alpha) then inflates to full size
+    with a periodic relaxation pass to improve packing.
     """
     if ndim not in (2, 3):
         raise ValueError("ndim must be 2 or 3.")
@@ -320,13 +294,15 @@ def generate_inclusion_voxels(
         raise ValueError("mean_particle_aspect_ratio must be > 0.")
     if target_vf is not None and not (0.0 <= target_vf <= 1.0):
         raise ValueError("target_vf must be in [0, 1].")
+    if ndim == 3 and not (0.0 < initial_alpha <= 1.0):
+        raise ValueError("initial_alpha must be in (0,1].")
 
     rng = np.random.default_rng(seed)
 
     box_size_um = np.asarray(box_size_um, dtype=float)
     box_size_vox = np.asarray(box_size_vox, dtype=int)
 
-    voxel_um = box_size_um / box_size_vox  # µm/voxel per axis
+    voxel_um = box_size_um / box_size_vox
     AR = float(mean_particle_aspect_ratio)
 
     # --- decide per-particle areas/volumes in physical units ---
@@ -345,46 +321,182 @@ def generate_inclusion_voxels(
             "target_vf": target_vf,
             "requested_total_measure_um": 0.0,
             "achieved_total_measure_um": 0.0,
+            "achieved_vf": 0.0,
         }
         return mask, info
 
+    # --- measures per particle (A in 2D, V in 3D) ---
     if size_factors is None:
-        # default: identical particles unless scaled by target_vf
         base = float(mean_particle_area_um2)
         measures = np.full(n_particles, base, dtype=float)
-
         if target_vf is not None:
             total_target = target_vf * box_measure
             measures[:] = total_target / n_particles
     else:
         sf = np.asarray(size_factors, dtype=float)
-        available_factors = np.asarray(sf, dtype=float)
-        sf = rng.choice(available_factors, size=n_particles, replace=True)
+        sf = rng.choice(sf, size=n_particles, replace=True)
 
         if size_factors_are_relative:
             if target_vf is None:
-                # If relative factors are provided but no target_vf, fall back to mean size scaling
-                # so that the *mean* matches mean_particle_area_um2.
-                # i.e., measures_i = sf_i * k, choose k so mean(measures)=mean_particle_area_um2
                 k = float(mean_particle_area_um2) / float(np.mean(sf))
                 measures = sf * k
             else:
                 total_target = target_vf * box_measure
                 measures = sf / float(np.sum(sf)) * total_target
         else:
-            # absolute areas/volumes directly
             measures = sf.copy()
             if target_vf is not None:
-                # scale absolute measures to match target_vf while preserving ratios
                 total_target = target_vf * box_measure
                 measures *= total_target / float(np.sum(measures))
 
     requested_total_measure = float(np.sum(measures))
 
-    # --- derive per-particle axes from area/volume + aspect ratio ---
-    # For prolate shapes:
-    # 2D: area = pi*a*b with a/b=AR => b=sqrt(A/(pi*AR)), a=AR*b
-    # 3D: volume = 4/3*pi*a*b*c with a/b=AR and b=c => b=(V/((4/3)*pi*AR))^(1/3), a=AR*b, c=b
+    # --- helpers ---
+    def min_image_delta(d, L):
+        return d - L * np.round(d / L)
+
+    def r_eff_hybrid(a, b, c, *, voxel_um=None, size_switch_vox=6.0, sharpness=3.0):
+        # volume-equivalent radius
+        r_vol = (a * b * c) ** (1.0 / 3.0)
+        # rms radius
+        r_rms = np.sqrt((a*a + b*b + c*c) / 3.0)
+
+        if voxel_um is None:
+            x = max(a, b, c)
+            t = x / float(size_switch_vox)
+        else:
+            max_axis_vox = max(a / voxel_um[0], b / voxel_um[1], c / voxel_um[2])
+            t = max_axis_vox / float(size_switch_vox)
+
+        w = (t ** sharpness) / (1.0 + t ** sharpness)
+        return (1.0 - w) * r_vol + w * r_rms
+
+    def propose_center_void_biased(*, trials=64):
+        if not centers:
+            return rng.random(ndim) * box_size_um
+
+        C = np.vstack(centers)
+        R = np.asarray(reffs, dtype=float) + np.asarray(clears, dtype=float)
+
+        best_c = None
+        best_score = -1e30
+
+        for _ in range(trials):
+            c = rng.random(ndim) * box_size_um
+            d = C - c[None, :]
+            if periodic:
+                d = min_image_delta(d, box_size_um[None, :])
+            dist = np.linalg.norm(d, axis=1)
+            score = np.min(dist - R)
+            if score > best_score:
+                best_score = score
+                best_c = c
+        return best_c
+
+    def relax_centers_spheres_periodic(C, R, L, *, n_sweeps=25, step=1.0, jitter=1e-9):
+        n = C.shape[0]
+        if n < 2:
+            return 0.0
+
+        max_overlap_seen = 0.0
+        for _ in range(n_sweeps):
+            moved = False
+            idxs = rng.permutation(n)
+            for ii in idxs:
+                for jj in range(ii + 1, n):
+                    d = C[jj] - C[ii]
+                    d = min_image_delta(d, L)
+                    dist = np.linalg.norm(d) + jitter
+                    min_dist = R[ii] + R[jj]
+                    overlap = min_dist - dist
+                    if overlap > 0:
+                        dir_ = d / dist
+                        shift = 0.5 * step * overlap * dir_
+                        C[ii] -= shift
+                        C[jj] += shift
+                        C[ii] = np.mod(C[ii], L)
+                        C[jj] = np.mod(C[jj], L)
+                        moved = True
+                        if overlap > max_overlap_seen:
+                            max_overlap_seen = overlap
+            if not moved:
+                break
+        return max_overlap_seen
+
+    def inflate_with_relaxation(
+            centers_um,
+            axes_target_um,
+            box_size_um,
+            *,
+            alpha_start=0.70,
+            alpha_end=1.00,
+            n_steps=25,
+            reff_mode="vol",  # "vol" or "rms"
+            n_sweeps=30,
+            step=1.0,
+            growth_clear_rel=0.0,  # NEW: relative clearance during growth
+            growth_constrained_mask=None,  # NEW: bool mask, True=constrained, False=free
+    ):
+        """
+        Inflate axes from alpha_start * target -> alpha_end * target.
+        After each inflation step, relax centers to remove overlaps (sphere proxy).
+        Optional clearance during growth:
+          - growth_clear_rel: adds clearance = growth_clear_rel * r_eff
+          - growth_constrained_mask: if given, only applies clearance where mask=True
+        """
+        centers = np.array(centers_um, dtype=float, copy=True)
+        axes_target = np.array(axes_target_um, dtype=float, copy=False)
+        L = np.asarray(box_size_um, dtype=float)
+
+        n = centers.shape[0]
+        if growth_constrained_mask is None:
+            constrained = np.ones(n, dtype=bool)
+        else:
+            constrained = np.asarray(growth_constrained_mask, dtype=bool)
+            if constrained.shape != (n,):
+                raise ValueError("growth_constrained_mask must have shape (n_placed,)")
+
+        alphas = np.linspace(alpha_start, alpha_end, n_steps)
+        max_ov = 0.0
+
+        progress = tqdm(total=n_steps)
+        for a in alphas:
+            axes = a * axes_target
+
+            A = axes[:, 0]
+            B = axes[:, 1]
+            Cc = axes[:, 2]
+
+            if reff_mode == "vol":
+                r_eff = (A * B * Cc) ** (1.0 / 3.0)
+            elif reff_mode == "rms":
+                r_eff = np.sqrt((A * A + B * B + Cc * Cc) / 3.0)
+            else:
+                raise ValueError("reff_mode must be 'vol' or 'rms'")
+
+            # --- NEW: clearance during growth ---
+            # clearance is only applied to constrained particles
+            extra = np.zeros_like(r_eff)
+            if growth_clear_rel != 0.0:
+                extra[constrained] = float(growth_clear_rel) * r_eff[constrained]
+
+            # Effective exclusion radius during relaxation:
+            # enforce dist >= (r_i + extra_i) + (r_j + extra_j)
+            R = r_eff + extra
+
+            ov = relax_centers_spheres_periodic(
+                centers, R, L,
+                n_sweeps=n_sweeps,
+                step=step,
+            )
+            max_ov = max(max_ov, ov)
+            progress.update()
+        progress.close()
+
+        axes_final = alpha_end * axes_target
+        return centers, axes_final, max_ov
+
+    # --- derive per-particle axes from measure + aspect ratio ---
     axes_list = []
     r_eff_list = []
     bnd_clear_list = []
@@ -406,42 +518,34 @@ def generate_inclusion_voxels(
             a = AR * b
             c = b
             ax = np.array([a, b, c], dtype=float)
-            # r_eff = float(max(a, b, c))
-            r_eff = (a * b * c) ** (1.0 / 3.0)
-            # r_eff = float(r_eff_hybrid(a, b, c, voxel_um=voxel_um, size_switch_vox=6.0, sharpness=3.0))
-
+            r_eff = float(r_eff_hybrid(a, b, c, voxel_um=voxel_um, size_switch_vox=6.0, sharpness=3.0))
             axes_list.append(ax)
             r_eff_list.append(r_eff)
             bnd_clear_list.append(r_eff * float(minreldistbound))
             inc_clear_list.append(r_eff * float(minreldistincl))
 
-    axes_list = np.asarray(axes_list, dtype=float)         # (n, ndim)
-    r_eff_list = np.asarray(r_eff_list, dtype=float)       # (n,)
-    bnd_clear_list = np.asarray(bnd_clear_list, dtype=float)  # (n,)
-    inc_clear_list = np.asarray(inc_clear_list, dtype=float)  # (n,)
-
-    # --- periodic distance helper (minimum image convention) ---
-    def min_image_delta(d, L):
-        return d - L * np.round(d / L)
+    axes_list = np.asarray(axes_list, dtype=float)           # (n, ndim)
+    r_eff_list = np.asarray(r_eff_list, dtype=float)         # (n,)
+    bnd_clear_list = np.asarray(bnd_clear_list, dtype=float) # (n,)
+    inc_clear_list = np.asarray(inc_clear_list, dtype=float) # (n,)
 
     # --- placement storage ---
-    centers = []     # list of center vectors in microns
-    axes_placed = [] # list of semi-axes vectors in microns
-    reffs = []       # effective radii for conservative distance tests (microns)
-    clears = []      # per-particle inclusion clearance (microns)
-    measures_placed = []
+    centers = []          # list of centers in microns
+    axes_placed = []      # current axes (shrunk during RSA, full after inflate)
+    axes_target = []      # full-size target axes (3D inflate uses this)
+    reffs = []            # collision proxy radii (match current size used in accept)
+    clears = []           # clearance (match current size)
+    measures_placed = []  # analytic measure of FULL particle (not shrunk)
 
     def accept_center(c, r_i, bnd_i, clear_i):
-        # boundary check (non-periodic)
         if not periodic:
             pad = r_i + bnd_i
             if np.any(c < pad) or np.any(c > (box_size_um - pad)):
                 return False
 
-        # inclusion distance check vs existing (bounding spheres + clearance)
         if centers:
-            C = np.vstack(centers)              # (k, ndim)
-            R = np.asarray(reffs, dtype=float)  # (k,)
+            C = np.vstack(centers)
+            R = np.asarray(reffs, dtype=float)
             CL = np.asarray(clears, dtype=float)
 
             d = C - c[None, :]
@@ -449,31 +553,25 @@ def generate_inclusion_voxels(
                 d = min_image_delta(d, box_size_um[None, :])
             dist = np.linalg.norm(d, axis=1)
 
-            # require dist >= (r_i + clear_i) + (r_j + clear_j)
             min_dist = (r_i + clear_i) + (R + CL)
             if np.any(dist < min_dist):
                 return False
-
         return True
 
-    # --- random sequential placement (ACTIVE SET version) ---
+    # --- RSA (active set) ---
     placed = 0
     total_attempts = 0
 
     order = np.argsort(-r_eff_list)  # big -> small
-
-    fail_counts = np.zeros(n_particles, dtype=int)
-
-    # IMPORTANT: this is now "per particle" budget before we retire it as unplaceable
-    max_attempts_per_particle = 10000
-
-    # active set: particles still waiting to be placed (in big->small order)
     remaining = list(order.tolist())
     cursor = 0
+    fail_counts = np.zeros(n_particles, dtype=int)
 
-    # optional overall stall limit (kept, but now just stops the whole run)
     stall_window = 20000
     no_progress_attempts = 0
+
+    max_attempts_per_particle_early = 50000
+    max_attempts_per_particle_late = 15000
 
     progress = tqdm(total=n_particles)
 
@@ -481,57 +579,80 @@ def generate_inclusion_voxels(
         total_attempts += 1
         no_progress_attempts += 1
 
-        # pick next candidate particle index from active set
         idx = remaining[cursor]
+        max_attempts_per_particle = max_attempts_per_particle_late if (placed > 0.85 * n_particles) else max_attempts_per_particle_early
 
-        # propose a random center
-        c = rng.random(ndim) * box_size_um
+        # proposal strategy tuned for 128^3
+        if placed < 0.80 * n_particles and no_progress_attempts < 5000:
+            c = rng.random(ndim) * box_size_um
+        elif no_progress_attempts < 20000:
+            c = propose_center_void_biased(trials=64)
+        else:
+            c = propose_center_void_biased(trials=256)
 
-        r_i = float(r_eff_list[idx])
-        bnd_i = float(bnd_clear_list[idx])
-        clear_i = float(inc_clear_list[idx])
+        # IMPORTANT: scale collision proxy + clearance by current alpha (3D)
+        if ndim == 3:
+            alpha = initial_alpha
+        else:
+            alpha = 1.0
+
+        r_i = float(alpha * r_eff_list[idx])
+        bnd_i = float(alpha * bnd_clear_list[idx])
+        clear_i = float(alpha * inc_clear_list[idx])
 
         if accept_center(c, r_i, bnd_i, clear_i):
-            # accept: place and REMOVE from active set
             centers.append(c)
-            axes_placed.append(axes_list[idx].copy())
+
+            ax_t = axes_list[idx].copy()
+            if ndim == 3:
+                axes_target.append(ax_t)             # full target
+                axes_placed.append(alpha * ax_t)     # current (shrunk)
+            else:
+                axes_placed.append(ax_t)
+
             reffs.append(r_i)
             clears.append(clear_i)
-            measures_placed.append(float(measures[idx]))
+            measures_placed.append(float(measures[idx]))  # full analytic measure
 
             placed += 1
             progress.update(1)
 
-            # reset stall counter
             no_progress_attempts = 0
 
-            # remove this particle from remaining
             remaining.pop(cursor)
-
-            # keep cursor valid
-            if remaining:
-                cursor %= len(remaining)
-            else:
-                cursor = 0
+            cursor = cursor % len(remaining) if remaining else 0
         else:
             fail_counts[idx] += 1
-
-            # if this particle is jammed: RETIRE it (remove from active set)
             if fail_counts[idx] >= max_attempts_per_particle:
                 remaining.pop(cursor)
-                if remaining:
-                    cursor %= len(remaining)
-                else:
-                    cursor = 0
+                cursor = cursor % len(remaining) if remaining else 0
             else:
-                # otherwise advance cursor
                 cursor = (cursor + 1) % len(remaining)
 
-        # optional: stop everything if we're totally jammed (no placements recently)
         if no_progress_attempts >= stall_window:
             break
 
     progress.close()
+
+    # --- post-RSA inflate + relax (3D only) ---
+    max_overlap = 0.0
+    if ndim == 3 and placed > 0 and initial_alpha < 1.0:
+        C0 = np.array(centers, dtype=float)
+        AX_target = np.array(axes_target, dtype=float)
+
+        C_new, AX_full, max_overlap = inflate_with_relaxation(
+            C0, AX_target, box_size_um,
+            alpha_start=0.70,
+            alpha_end=1.00,
+            n_steps=25,
+            reff_mode="vol",
+            n_sweeps=30,
+            step=1.0,
+            growth_clear_rel=0.1,
+        )
+
+        centers = [c for c in C_new]
+        axes_placed = [ax for ax in AX_full]  # now full-size axes
 
     # --- rasterize to voxels ---
     mask = np.zeros(tuple(box_size_vox.tolist()), dtype=dtype)
@@ -599,13 +720,15 @@ def generate_inclusion_voxels(
         "axes_um": np.array(axes_placed) if axes_placed else np.zeros((0, ndim)),
         "periodic": periodic,
         "target_vf": target_vf,
-        "requested_total_measure_um": requested_total_measure,  # sum of A_i (2D) or V_i (3D)
+        "requested_total_measure_um": requested_total_measure,
         "achieved_total_measure_um": achieved_total_measure,
         "achieved_vf": achieved_vf,
-        "size_factors_used": np.asarray(size_factors) if size_factors is not None else None,
-        "size_factors_are_relative": size_factors_are_relative,
+        "voxel_vf": float(mask.mean()),
+        "inflate_initial_alpha": float(initial_alpha) if ndim == 3 else None,
+        "inflate_max_overlap_um": float(max_overlap) if ndim == 3 else None,
     }
     return mask, info
+
 
 
 if __name__ == "__main__":

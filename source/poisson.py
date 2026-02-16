@@ -195,9 +195,7 @@ def estimate_n_particles_3d(
     physical_spacing: float,
     box_size: Union[float, Tuple[float, float, float]],
     inclusion_value: int = 1,
-    min_size: Optional[int] = None,
-    aspect_ratio_k: Optional[float] = None,
-    # NEW: composition-based override of VV
+    aspect_ratio_k: Optional[float] = 1,
     composition_wt: Optional[Tuple[float, float]] = None,   # (w_PP, w_PS)
     densities: Tuple[float, float] = (0.90, 1.05),          # (rho_PP, rho_PS) in g/cm^3 or consistent units
     inclusion_phase: str = "PS",                            # "PS" or "PP"
@@ -239,7 +237,7 @@ def estimate_n_particles_3d(
         VV_source = "composition (wt%→vol% using densities)"
 
     # --- Extract 2D particle stats (pixel units) and scale to physical units ---
-    stats_px = particle_features(ref_image, min_size=min_size)
+    stats_px = particle_features(ref_image, inclusion_value=inclusion_value)
     stats = stats_px.apply_physical_scaling(physical_spacing, ndim=2)
 
     # Decide aspect ratio k

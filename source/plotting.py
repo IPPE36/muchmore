@@ -6,10 +6,10 @@ matplotlib.use("agg")
 
 def plot_field(field, filepath: str) -> None:
     assert field.ndim == 2
-    plt.imshow(field.T)
+    plt.imshow(field.T, cmap="gray")
     plt.axis("off")
     plt.tight_layout()
-    plt.savefig(filepath, dpi=300)
+    plt.savefig(filepath, dpi=300, bbox_inches='tight', pad_inches=0)
     return None
 
 

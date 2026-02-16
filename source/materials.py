@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
 import warnings
 from dataclasses import dataclass, field
-from typing import List, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -192,6 +193,96 @@ class MaterialModel:
             eps_conv = eps_conv[:i_neck_start]
             sig_conv = sig_conv[:i_neck_start]
         return eps_conv.tolist(), sig_conv.tolist()
+
+    # ---------------------------
+    # Serialization (dump/load)
+    # ---------------------------
+    def dump(self) -> Dict[str, Any]:
+        """
+        Return a JSON-serializable dict with model state + data.
+        Expects self.replicates (list of (x,y)) and self.df_meta (pd.DataFrame) if present.
+        """
+        state: Dict[str, Any] = {
+            "class": self.__class__.__name__,
+            "module": self.__class__.__module__,
+        }
+
+        # store replicates if available
+        if hasattr(self, "replicates") and self.replicates is not None:
+            reps = []
+            for x, y in self.replicates:
+                reps.append({
+                    "x": [float(v) for v in x],
+                    "y": [float(v) for v in y],
+                })
+            state["replicates"] = reps
+
+        # store meta dataframe if available
+        if hasattr(self, "df_meta") and self.df_meta is not None:
+            df = self.df_meta.copy()
+            state["df_meta"] = {
+                "columns": [str(c) for c in df.columns],
+                "records": df.astype(object).where(pd.notnull(df), None).to_dict(orient="records"),
+            }
+
+        # store any additional lightweight parameters a subclass may set
+        # (override _extra_dump/_extra_load in subclasses)
+        state["extra"] = self._extra_dump()
+
+        return state
+
+    @classmethod
+    def load(cls, state: Dict[str, Any]) -> "MaterialModel":
+        """
+        Create an instance from a dict previously returned by dump().
+        Note: this constructs `cls`, not the recorded class in state["class"].
+        """
+        obj = cls()
+
+        # replicates
+        reps_state = state.get("replicates")
+        if reps_state is not None:
+            obj.replicates = [
+                (r.get("x", []), r.get("y", []))
+                for r in reps_state
+            ]
+
+        # df_meta
+        meta_state = state.get("df_meta")
+        if meta_state is not None:
+            records = meta_state.get("records", [])
+            columns = meta_state.get("columns", None)
+            df = pd.DataFrame.from_records(records)
+            if columns is not None:
+                # enforce original column order if provided
+                df = df.reindex(columns=columns)
+            obj.df_meta = df
+
+        obj._extra_load(state.get("extra", {}))
+        return obj
+
+    def dump_json(self, path: str, *, indent: int = 2) -> None:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self.dump(), f, indent=indent, ensure_ascii=False)
+
+    @classmethod
+    def load_json(cls, path: str) -> "MaterialModel":
+        with open(path, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        return cls.load(state)
+
+    def _extra_dump(self) -> Dict[str, Any]:
+        """
+        Hook for subclasses to add parameters (e.g. fitted coefficients).
+        Must return JSON-serializable data.
+        """
+        return {}
+
+    def _extra_load(self, extra: Dict[str, Any]) -> None:
+        """
+        Hook for subclasses to restore parameters.
+        """
+        return
 
 
 @dataclass
