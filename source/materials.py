@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import warnings
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Sequence, Tuple
@@ -111,7 +110,7 @@ class MaterialModel:
     def fit(self, x, y):
         raise NotImplementedError
 
-    def plot(self):
+    def plot(self, filepath: str):
         raise NotImplementedError
 
     def name(self):
@@ -166,11 +165,6 @@ class MaterialModel:
         sig_conv = s * (1.0 + e)
         # A_conv = A0 / (1.0 + e)
         slope_conv = np.gradient(sig_conv, eps_conv)
-
-        import matplotlib.pyplot as plt
-        plt.plot(eps_conv, sig_conv)
-        plt.savefig("test.png")
-        plt.close()
 
         # Necking start at peak of sig_conv
         i0 = np.where(eps_conv < 0.25)[0][-1]
@@ -228,6 +222,10 @@ class MaterialModel:
         # store any additional lightweight parameters a subclass may set
         # (override _extra_dump/_extra_load in subclasses)
         state["extra"] = self._extra_dump()
+        state["poisson"] = self.poisson_ratio
+        state["young_modulus"] = self.young_modulus
+        state["density"] = self.density
+        state["plastic_table"] = self.plastic_table
 
         return state
 
@@ -237,7 +235,12 @@ class MaterialModel:
         Create an instance from a dict previously returned by dump().
         Note: this constructs `cls`, not the recorded class in state["class"].
         """
-        obj = cls()
+        density = state["density"]
+        E = state["young_modulus"]
+        poisson_ratio = state["poisson"]
+        plastic_table = state["plastic_table"]
+        obj = cls(density=density, young_modulus=E, poisson_ratio=poisson_ratio)
+        setattr(obj, "plastic_table", plastic_table)
 
         # replicates
         reps_state = state.get("replicates")
@@ -288,19 +291,20 @@ class MaterialModel:
 @dataclass
 class ElasticMM(MaterialModel):
 
+    density: float
     young_modulus: float
     poisson_ratio: float = 0.40
+    plastic_table: List[Tuple[float, float]] = field(default_factory=list)
     df_meta: pd.DataFrame = field(default_factory=pd.DataFrame)
     replicates: List[Tuple[List[float], List[float]]] = field(default_factory=list)
 
     def predict(self, eps: float) -> float:
         return self.young_modulus * eps
 
-    def plot(self, max_strain: float = 0.03, n: int = 400) -> None:
+    def plot(self, filepath: str, max_strain: float = 0.03, n: int = 400) -> None:
         """Plot model curve alongside replicates using existing plot_material_model()."""
         x = np.linspace(0.0, max_strain, n).tolist()
         y = [self.predict(x_) for x_ in x]
-        filepath = os.path.join("plots", f"EM_{self.name()}.png")
         plot_material_model(self.replicates, x, y, self.df_meta, max_strain, filepath)
         return None
 
@@ -308,24 +312,26 @@ class ElasticMM(MaterialModel):
         """Return Abaqus *Material block for linear elasticity."""
         out = list()
         out.append(f"*Material, name={name}")
+        out.append("*Density")
+        out.append(f"{self.density * 1e-9:.6g}")
         out.append("*Elastic")
         out.append(f"{self.young_modulus:.6g}, {self.poisson_ratio:.6g}")
         return "\n".join(out)
 
     @classmethod
-    def from_xy(cls, eps: list, sig: list, poisson_ratio: float = 0.40) -> "ElasticMM":
+    def from_xy(cls, eps: list, sig: list, density: float = 1.0, poisson_ratio: float = 0.40) -> "ElasticMM":
         """Generate model directly from xy data"""
         xs = [float(x) for x in eps]
         ys = [float(y) for y in sig]
         xs, ys = super().eng_to_true(xs, ys)
         E, _ = cls.fit(xs, ys)
-        return cls(young_modulus=E, poisson_ratio=poisson_ratio, df_meta=pd.DataFrame(), replicates=[(xs, ys)])
+        return cls(density=density, young_modulus=E, poisson_ratio=poisson_ratio, df_meta=pd.DataFrame(), replicates=[(xs, ys)])
 
     @classmethod
-    def from_xlsx(cls, filepath: str, poisson_ratio: float = 0.40) -> "ElasticMM":
+    def from_xlsx(cls, filepath: str, density: float = 1.0, poisson_ratio: float = 0.40) -> "ElasticMM":
         replicates, df_meta = super().read_xlsx(cls, filepath)
         E_mean = np.mean([cls.fit(x, y)[0] for x, y in replicates])
-        return cls(young_modulus=E_mean, poisson_ratio=poisson_ratio, df_meta=df_meta, replicates=replicates)
+        return cls(density=density, young_modulus=E_mean, poisson_ratio=poisson_ratio, df_meta=df_meta, replicates=replicates)
 
     @staticmethod
     def fit(x, y, lo: float = 0.0005, hi: float = 0.002) -> Tuple[float, float]:
@@ -345,6 +351,7 @@ class ElasticMM(MaterialModel):
 @dataclass
 class ElasticPlasticMM(MaterialModel):
 
+    density: float
     young_modulus: float
     poisson_ratio: float = 0.40
     plastic_table: List[Tuple[float, float]] = field(default_factory=list)
@@ -394,13 +401,12 @@ class ElasticPlasticMM(MaterialModel):
         sigma_pred = float(np.interp(float(eps_true), eps_total, sig))
         return sigma_pred
 
-    def plot(self, max_strain: float = 0.5, n: int = 100) -> None:
+    def plot(self, filepath: str, max_strain: float = 0.5, n: int = 100) -> None:
         """Plot model curve alongside replicates using existing plot_material_model()."""
         max_ = self.df_meta["eB"].max() / 100
         max_strain = max_ if max_ < max_strain else max_strain
         x = np.linspace(0.0, max_strain, n).tolist()
         y = [self.predict(x_) for x_ in x]
-        filepath = os.path.join("plots", f"EPM_{self.name()}.png")
         plot_material_model(self.replicates, x, y, self.df_meta, max_strain, filepath)
         return None
 
@@ -408,6 +414,8 @@ class ElasticPlasticMM(MaterialModel):
         """Return Abaqus *Material block for linear elasto-plasticity."""
         out = list()
         out.append("*Material, name=ELASTOPLASTIC")
+        out.append("*Density")
+        out.append(f"{self.density * 1e-9:.6g}")
         out.append("*Elastic")
         out.append(f"{self.young_modulus:.6g}, {self.poisson_ratio:.6g}")
         out.append("*Plastic")
@@ -416,18 +424,18 @@ class ElasticPlasticMM(MaterialModel):
         return "\n".join(out)
 
     @classmethod
-    def from_xy(cls, eps: list, sig: list, poisson_ratio: float = 0.40) -> "ElasticPlasticMM":
+    def from_xy(cls, eps: list, sig: list, density: float = 1.0, poisson_ratio: float = 0.40) -> "ElasticPlasticMM":
         xs = [float(x) for x in eps]
         ys = [float(y) for y in sig]
         xs, ys = super().eng_to_true(xs, ys)
         E, b = ElasticMM.fit(xs, ys)
         ys = ys - b  # remove intercept
         table = cls._build_plastic_table(xs, ys, young_modulus=E)
-        return cls(young_modulus=E, poisson_ratio=poisson_ratio, plastic_table=table, df_meta=pd.DataFrame(),
-                   replicates=[(xs, ys)])
+        return cls(density=density, young_modulus=E, poisson_ratio=poisson_ratio, plastic_table=table,
+                   df_meta=pd.DataFrame(), replicates=[(xs, ys)])
 
     @classmethod
-    def from_xlsx(cls, filepath: str, poisson_ratio: float = 0.40) -> "ElasticPlasticMM":
+    def from_xlsx(cls, filepath: str, density: float = 1.0, poisson_ratio: float = 0.40) -> "ElasticPlasticMM":
         replicates, df_meta = super().read_xlsx(cls, filepath)
         E_mean = np.mean([ElasticMM.fit(x_, y_)[0] for x_, y_ in replicates])
 
@@ -442,8 +450,8 @@ class ElasticPlasticMM(MaterialModel):
         avg_x, avg_y = average_xy_over_full_union(sigs, grid="linspace", n_points=1000)
 
         table = cls._build_plastic_table(avg_x, avg_y, young_modulus=E_mean)
-        return cls(young_modulus=E_mean, poisson_ratio=poisson_ratio, plastic_table=table, df_meta=df_meta,
-                   replicates=replicates)
+        return cls(density=density, young_modulus=E_mean, poisson_ratio=poisson_ratio, plastic_table=table,
+                   df_meta=df_meta, replicates=replicates)
 
     @staticmethod
     def _build_plastic_table(

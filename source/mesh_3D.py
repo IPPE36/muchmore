@@ -148,6 +148,9 @@ def mesh_3d(
     load_case: Literal["Tensile-X", "Tensile-Y", "Tensile-Z"] = "Tensile-X",
     strain: float = 0.03,
     show: bool = False,
+    mat_a: str = None,
+    mat_b: str = None,
+    tie_constraint: bool = True,
     **kwargs,
 ):
 
@@ -225,88 +228,10 @@ def mesh_3d(
         gmsh.fltk.run()
 
     with timer("POSTPROCESS INP"):
-        postprocess_inp(inp_path, out_path, name_model, name_phase_a, name_phase_b, load_case, strain, physical_spacing)
+        postprocess_inp(inp_path, out_path, name_model, name_phase_a, name_phase_b, load_case, strain, physical_spacing,
+                        mat_a=mat_a, mat_b=mat_b, tie_constraint=tie_constraint)
 
     gmsh.finalize()
-    return
-
-
-def mesh_3d_random_inclusion(
-        size: int = 128,
-        inclusion_sets: List[int] = [24, 12],  # place 12 inclusions with radius 24
-        algo: Literal["frontal", "delaunay", "hxt"] = "frontal",
-        element_order: Literal[1, 2] = 2,
-        name_model: str = "RVE",
-        max_attempts: int = 10000,
-        min_rel_dist_bnd: float = 0.1,
-        min_rel_dist_inc: float = 0.1,
-        name_phase_a: str = "PHASE-A",
-        name_phase_b: str = "PHASE-B",
-        physical_spacing: float = 1.0,
-        load_case: Literal["Tensile-X", "Tensile-Y", "Tensile-Z", "Shear-XY", "Shear-XZ", "Shear-YZ"] = "Tensile-X",
-        strain: float = 0.03,
-        show: bool = True,
-        **kwargs,
-):
-    init_params = {
-        "inclusionSets": inclusion_sets,
-        "inclusionType": "Sphere",
-        "size": [size] * 3,
-        "origin": [0, 0, 0],
-        "periodicityFlags": [1, 1, 1],
-        "domainGroup": name_phase_a,
-        "inclusionGroup": name_phase_b,
-        "gmshConfigChanges": {
-            "General.Terminal": 0,
-            "Mesh.CharacteristicLengthExtendFromBoundary": 0,
-            "Mesh.ElementOrder": element_order,
-            "Mesh.Algorithm3D": {"delaunay": 1, "frontal": 4, "hxt": 10}[algo],
-            "Mesh.OptimizeNetgen": 1,
-            "Mesh.Optimize": 1,
-            "Mesh.ColorCarousel": 1,
-            "Mesh.Format": 39,  # = ABAQUS .inp
-            "General.Verbosity": 0,
-        }
-    }
-    model_params = {
-        "placementOptions": {
-            "maxAttempts": max_attempts,
-            "min_rel_dist_bnd": min_rel_dist_bnd,
-            "minRelDistInc": min_rel_dist_inc
-        }
-    }
-    mesh_params = {
-        "threads": None,
-        "refinementOptions": {
-            "maxMeshSize": "auto",
-            "inclusionRefinement": True,
-            "interInclusionRefinement": True,
-            "elementsPerCircumference": 18,
-            "elementsBetweenInclusions": 3,
-            "inclusionRefinementWidth": 3,
-            "transitionElements": "auto",
-            "aspectRatio": 1.5
-        }
-    }
-    rve = RandomInclusionRVE(**init_params)
-
-    with timer("Setup Geometry"):
-        rve.createGmshModel(**model_params)
-
-    with timer("MESHING"):
-        rve.createMesh(**mesh_params)
-
-    with timer("STORE RVE"):
-        inp_path = str(ROOT / "temp" / f"{name_model}.inp")
-        rve.saveMesh(inp_path)
-
-    if show:
-        gmsh.fltk.run()
-
-    with timer("POSTPROCESS INP"):
-        out_path = inp_path.replace(".inp", "_post.inp")
-        postprocess_inp(inp_path, out_path, name_model, name_phase_a, name_phase_b, load_case, strain, physical_spacing)
-
     return
 
 

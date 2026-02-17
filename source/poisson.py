@@ -177,6 +177,10 @@ def weight_to_volume_fraction(
     rho_ps: float,
 ) -> Tuple[float, float]:
     """Return (phi_pp, phi_ps) from weight fractions and densities."""
+    if w_pp == 100:
+        return 1.0, 0.0
+    elif w_ps == 100:
+        return 0.0, 1.0
     if any(v <= 0 for v in (w_pp, w_ps, rho_pp, rho_ps)):
         raise ValueError("Weight fractions and densities must be > 0.")
     s = w_pp + w_ps

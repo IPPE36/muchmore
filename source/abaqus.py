@@ -448,8 +448,10 @@ def postprocess_inp(
     load_case: Literal["Tensile-X", "Tensile-Y", "Tensile-Z"] = "Tensile-X",
     strain: float = 0.01,
     physical_spacing: float = 1.0,
-    tied: bool = True,
+    tie_constraint: bool = True,
     tol: float = 1e-6,
+    mat_a: str = None,
+    mat_b: str = None,
 ) -> Path:
     """Convert an orphan Abaqus .inp (no *Part/*Assembly) into Part/Assembly. Create periodic boundary conditions.
     Create loading scenarios..., Scale xyz to physical dimensions of the RVE..."""
@@ -554,7 +556,7 @@ def postprocess_inp(
 
     # --- tie surfaces
     # stiffer matrix = master / assumes PP-PS nomenclature for phases A-B
-    if tied:
+    if tie_constraint:
         out.append("*Tie, name=TIE_AB, adjust=NO\n")
         out.append(f"{name_phase_b}-IF, {name_phase_a}-IF\n")
 
@@ -723,17 +725,21 @@ def postprocess_inp(
 
     # --- materials ---
     out.append("** --- materials ---\n")
-    out.append(f"*Material, name={name_phase_a}\n")
-    out.append("*Density\n")
-    out.append("9.5e-10\n")
-    out.append("*Elastic\n")
-    out.append("1500., 0.39\n")
-    out.append(f"*Material, name={name_phase_b}\n")
-    out.append("*Density\n")
-    out.append("9.5e-10\n")
-    out.append("*Elastic\n")
-    out.append("1000., 0.43\n")
-    out.append("** --- end materials ---\n")
+    if mat_a is None or mat_b is None:
+        out.append(f"*Material, name={name_phase_a}\n")
+        out.append("*Density\n")
+        out.append("9.5e-10\n")
+        out.append("*Elastic\n")
+        out.append("1500., 0.39\n")
+        out.append(f"*Material, name={name_phase_b}\n")
+        out.append("*Density\n")
+        out.append("9.5e-10\n")
+        out.append("*Elastic\n")
+        out.append("1000., 0.43\n")
+        out.append("** --- end materials ---\n")
+    else:
+        out.append(mat_a)
+        out.append(mat_b)
 
     # --- boundary conditions ---
     if load_case == "Tensile-X":
