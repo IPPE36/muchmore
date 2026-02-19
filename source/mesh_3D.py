@@ -1,18 +1,16 @@
 import subprocess
 from pathlib import Path
-from typing import List, Literal
+from typing import Literal, List
 
 import gmsh
 import numpy as np
 import pyvista as pv
 from gmshModel.Model.GenericRVE import GenericRVE
-from gmshModel.Model.RandomInclusionRVE import RandomInclusionRVE
 from scipy.ndimage import distance_transform_edt
 from skimage.measure import marching_cubes
 
-
-from source.timer import timer
 from source.abaqus import postprocess_inp
+from source.timer import timer
 
 ROOT = Path(__file__).resolve().parents[1]
 FREECAD_WORKER = str(ROOT / "source" / "freecad_utils.py")
@@ -134,7 +132,7 @@ def periodic_iso_surfaces(field, min_area: float = 50.0, step_size: int = 2) -> 
 
 
 def mesh_3d(
-    field: np.ndarray,
+    field: np.ndarray = None,
     algo: Literal["frontal", "delaunay", "hxt"] = "frontal",
     element_order: Literal[1, 2] = 2,
     h: float = 0.05,
@@ -144,7 +142,7 @@ def mesh_3d(
     name_phase_a: str = "PHASE-A",
     name_phase_b: str = "PHASE-B",
     mesh_level: Literal[1, 2, 3] = 3,
-    physical_spacing: float = 1.0,
+    spacing: float = 1.0,
     load_case: Literal["Tensile-X", "Tensile-Y", "Tensile-Z"] = "Tensile-X",
     strain: float = 0.03,
     show: bool = False,
@@ -164,6 +162,7 @@ def mesh_3d(
     b_path = str(ROOT / "temp" / f"{name_model}_{name_phase_b}.step")
 
     nx, ny, nz = field.shape
+
     rve = GenericRVE(
         size=[float(nx), float(ny), float(nz)],
         origin=[0.0, 0.0, 0.0],
@@ -228,7 +227,7 @@ def mesh_3d(
         gmsh.fltk.run()
 
     with timer("POSTPROCESS INP"):
-        postprocess_inp(inp_path, out_path, name_model, name_phase_a, name_phase_b, load_case, strain, physical_spacing,
+        postprocess_inp(inp_path, out_path, name_model, name_phase_a, name_phase_b, load_case, strain, spacing,
                         mat_a=mat_a, mat_b=mat_b, tie_constraint=tie_constraint)
 
     gmsh.finalize()

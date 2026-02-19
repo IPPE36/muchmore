@@ -557,8 +557,8 @@ def postprocess_inp(
     # --- tie surfaces
     # stiffer matrix = master / assumes PP-PS nomenclature for phases A-B
     if tie_constraint:
-        out.append("*Tie, name=TIE_AB, adjust=NO\n")
-        out.append(f"{name_phase_b}-IF, {name_phase_a}-IF\n")
+        out.append("*Tie, name=TIE, adjust=NO\n")
+        out.append(f"PART-1.{name_phase_b}-IF, PART-1.{name_phase_a}-IF\n")
 
     # --- global bbox ---
     bb_min, bb_max = _bbox(nodes)
@@ -739,7 +739,9 @@ def postprocess_inp(
         out.append("** --- end materials ---\n")
     else:
         out.append(mat_a)
+        out.append("\n")
         out.append(mat_b)
+        out.append("\n")
 
     # --- boundary conditions ---
     if load_case == "Tensile-X":
@@ -775,6 +777,8 @@ def postprocess_inp(
     out.append("*Output, history, frequency=1\n")
     out.append("*Energy Output\n")
     out.append("ALLIE, ALLSE, ALLWK, ALLPD, ALLDMD, ALLCD, ETOTAL\n")
+    out.append("*Node Output, nset=PMAX\n")
+    out.append("U, RF\n")
     out.append("** --- end step & output ---\n")
 
     Path(out_path).write_text("".join(out), encoding="utf-8")

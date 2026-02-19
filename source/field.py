@@ -1,4 +1,6 @@
 from typing import Tuple
+import tempfile
+import os
 
 import gstools as gs
 import numpy as np
@@ -8,6 +10,7 @@ from numpy.fft import fftfreq, rfftfreq, irfftn
 from scipy.ndimage import label, gaussian_filter
 from skimage import filters
 from tqdm import tqdm
+import stltovoxel
 
 from source.features import particle_features, ParticleStats
 from source.mesh_2D import mesh_2d
@@ -15,6 +18,27 @@ from source.mesh_3D import mesh_3d
 from source.timer import timed
 
 memory = Memory(".cache", verbose=0)
+
+
+@timed("stl to field")
+@memory.cache
+def field_from_stl(filepath: str) -> np.ndarray:
+    tmp = tempfile.NamedTemporaryFile(suffix=".npy", delete=False)
+    tmp.close()
+    try:
+        stltovoxel.convert_file(filepath, output_file_path=tmp.name)
+        coords = np.load(tmp.name)
+        coords = np.rint(coords).astype(np.int64)
+        mins = coords.min(axis=0)
+        maxs = coords.max(axis=0)
+        coords -= mins
+        shape = tuple((maxs - mins + 1))
+        field = np.zeros(shape, dtype=np.uint8)
+        field[coords[:, 0], coords[:, 1], coords[:, 2]] = 1
+        print(f"{filepath}: volume_fraction={np.count_nonzero(field) / field.size:.2f}, shape={field.shape}")
+        return field
+    finally:
+        os.remove(tmp.name)
 
 
 @timed("Sample field SRF")
@@ -201,10 +225,11 @@ def dump_field(field: np.ndarray, filepath: str) -> None:
     np.save(filepath, field.astype(np.uint8))
 
 
-def mesh_field(field: np.ndarray, **kwargs):
-    if field.ndim == 2:
+def mesh_field(field: np.ndarray = None, **kwargs):
+    ndim = 3 if field is None else field.ndim
+    if ndim == 2:
         mesh_2d(field, **kwargs)
-    elif field.ndim == 3:
+    elif ndim == 3:
         mesh_3d(field, **kwargs)
     else:
         raise ValueError("mesh_field requires a 2D or 3D array!")
