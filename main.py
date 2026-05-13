@@ -34,8 +34,8 @@ if __name__ == "__main__":
     #     m.dump_json(os.path.join("temp", f.replace(".xlsx", ".json")))
     #     m.plot(os.path.join("plots", f"EPM_{m.name()}.png"))
 
-    m_pp = ElasticPlasticMM.load_json(os.path.join("temp", "PP-PS_100-000.json"))
-    m_ps = ElasticPlasticMM.load_json(os.path.join("temp", "PP-PS_000-100.json"))
+    # m_pp = ElasticPlasticMM.load_json(os.path.join("temp", "PP-PS_100-000.json"))
+    # m_ps = ElasticPlasticMM.load_json(os.path.join("temp", "PP-PS_000-100.json"))
 
     dir_path = os.path.join("data", "microstructures", "md_zellen")
     for f in os.listdir(dir_path):
@@ -52,18 +52,18 @@ if __name__ == "__main__":
         rve_name = f"MD_{vf_pp}_{vf_ps}"
 
         if vf_pp >= vf_ps:
-            mat_a = m_ps.to_inp_str()  # inclusion
-            mat_b = m_pp.to_inp_str()  # matrix
+            # mat_a = m_ps.to_inp_str()  # inclusion
+            # mat_b = m_pp.to_inp_str()  # matrix
             name_phase_a = "PHASE-PS"
             name_phase_b = "PHASE-PP"
         else:
-            mat_a = m_pp.to_inp_str()  # inclusion
-            mat_b = m_ps.to_inp_str()  # matrix
+            # mat_a = m_pp.to_inp_str()  # inclusion
+            # mat_b = m_ps.to_inp_str()  # matrix
             name_phase_a = "PHASE-PP"
             name_phase_b = "PHASE-PS"
 
-        mat_a = mat_a.replace("name=ELASTOPLASTIC", f"name={name_phase_a}")
-        mat_b = mat_b.replace("name=ELASTOPLASTIC", f"name={name_phase_b}")
+        # mat_a = mat_a.replace("name=ELASTOPLASTIC", f"name={name_phase_a}")
+        # mat_b = mat_b.replace("name=ELASTOPLASTIC", f"name={name_phase_b}")
 
         field = field_from_stl(filepath)
 
@@ -75,11 +75,13 @@ if __name__ == "__main__":
             spacing=md_out_size / field.shape[0],
             load_case="Tensile-X",
             strain=0.15,
-            mat_a=mat_a,
-            mat_b=mat_b,
+            # mat_a=mat_a,
+            # mat_b=mat_b,
             name_phase_a=name_phase_a,
             name_phase_b=name_phase_b,
-            tie_constraint=True,
+            tie_constraint=False,
+            static_solver=False,
+            linear_mat=False,
             show=False,
         )
 
@@ -188,17 +190,17 @@ if __name__ == "__main__":
                 field = invert_binary_field(field)
 
             if vf_pp >= vf_ps:
-                mat_a = m_ps.to_inp_str()  # inclusion
-                mat_b = m_pp.to_inp_str()  # matrix
+                # mat_a = m_ps.to_inp_str()  # inclusion
+                # mat_b = m_pp.to_inp_str()  # matrix
                 name_phase_a = "PHASE-PS"
                 name_phase_b = "PHASE-PP"
             else:
-                mat_a = m_pp.to_inp_str()  # inclusion
-                mat_b = m_ps.to_inp_str()  # matrix
+                # mat_a = m_pp.to_inp_str()  # inclusion
+                # mat_b = m_ps.to_inp_str()  # matrix
                 name_phase_a = "PHASE-PP"
                 name_phase_b = "PHASE-PS"
-            mat_a = mat_a.replace("name=ELASTOPLASTIC", f"name={name_phase_a}")
-            mat_b = mat_b.replace("name=ELASTOPLASTIC", f"name={name_phase_b}")
+            # mat_a = mat_a.replace("name=ELASTOPLASTIC", f"name={name_phase_a}")
+            # mat_b = mat_b.replace("name=ELASTOPLASTIC", f"name={name_phase_b}")
 
             mesh_field(
                 field=field,
@@ -208,9 +210,12 @@ if __name__ == "__main__":
                 spacing=out_size/out_shape,
                 load_case="Tensile-X",
                 strain=0.15,
-                mat_a=mat_a,
-                mat_b=mat_b,
+                # mat_a=mat_a,
+                # mat_b=mat_b,
                 name_phase_a=name_phase_a,
                 name_phase_b=name_phase_b,
-                tie_constraint=True,
+                tie_constraint=False,
+                static_solver=False,
+                linear_mat=False,
+                show=False,
             )

@@ -146,9 +146,11 @@ def mesh_3d(
     load_case: Literal["Tensile-X", "Tensile-Y", "Tensile-Z"] = "Tensile-X",
     strain: float = 0.03,
     show: bool = False,
-    mat_a: str = None,
-    mat_b: str = None,
-    tie_constraint: bool = True,
+    # mat_a: str = None,
+    # mat_b: str = None,
+    tie_constraint: bool = False,
+    linear_mat: bool = False,
+    static_solver: bool = False,
     **kwargs,
 ):
 
@@ -228,7 +230,7 @@ def mesh_3d(
 
     with timer("POSTPROCESS INP"):
         postprocess_inp(inp_path, out_path, name_model, name_phase_a, name_phase_b, load_case, strain, spacing,
-                        mat_a=mat_a, mat_b=mat_b, tie_constraint=tie_constraint)
+                        tie_constraint=tie_constraint, linear_mat=linear_mat, static_solver=static_solver)
 
     gmsh.finalize()
     return

@@ -448,10 +448,10 @@ def postprocess_inp(
     load_case: Literal["Tensile-X", "Tensile-Y", "Tensile-Z"] = "Tensile-X",
     strain: float = 0.01,
     physical_spacing: float = 1.0,
-    tie_constraint: bool = True,
     tol: float = 1e-6,
-    mat_a: str = None,
-    mat_b: str = None,
+    static_solver: bool = False,
+    tie_constraint: bool = False,
+    linear_mat: bool = False,
 ) -> Path:
     """Convert an orphan Abaqus .inp (no *Part/*Assembly) into Part/Assembly. Create periodic boundary conditions.
     Create loading scenarios..., Scale xyz to physical dimensions of the RVE..."""
@@ -553,12 +553,6 @@ def postprocess_inp(
     out.append("*Assembly, name=Assembly\n")
     out.append(f"*Instance, name={name_instance}, part={name_model}\n")
     out.append("*End Instance\n")
-
-    # --- tie surfaces
-    # stiffer matrix = master / assumes PP-PS nomenclature for phases A-B
-    if tie_constraint:
-        out.append("*Tie, name=TIE, adjust=NO\n")
-        out.append(f"PART-1.{name_phase_b}-IF, PART-1.{name_phase_a}-IF\n")
 
     # --- global bbox ---
     bb_min, bb_max = _bbox(nodes)
@@ -724,8 +718,8 @@ def postprocess_inp(
     out.append("*End Assembly\n\n")
 
     # --- materials ---
-    out.append("** --- materials ---\n")
-    if mat_a is None or mat_b is None:
+    if linear_mat:
+        out.append("** --- materials ---\n")
         out.append(f"*Material, name={name_phase_a}\n")
         out.append("*Density\n")
         out.append("9.5e-10\n")
@@ -738,10 +732,129 @@ def postprocess_inp(
         out.append("1000., 0.43\n")
         out.append("** --- end materials ---\n")
     else:
-        out.append(mat_a)
-        out.append("\n")
-        out.append(mat_b)
-        out.append("\n")
+        # --- PHASE-PP ---
+        out.append("** --- materials ---\n")
+        out.append(f"*Material, name={name_phase_a}\n")
+        out.append("*Density\n")
+        out.append("9.5e-10,\n")
+        out.append("*Elastic\n")
+        out.append("2000.9, 0.42\n")
+        out.append("*Plastic\n")
+        out.append(" 16.0073,      0.\n")
+        out.append(" 18.3023, 0.00242\n")
+        out.append(" 20.2865, 0.00409\n")
+        out.append(" 22.0065, 0.00575\n")
+        out.append(" 23.4838, 0.00742\n")
+        out.append(" 24.7294, 0.00909\n")
+        out.append(" 25.7584, 0.01076\n")
+        out.append(" 26.6408, 0.01243\n")
+        out.append(" 27.4086, 0.01409\n")
+        out.append(" 28.1373, 0.01576\n")
+        out.append(" 28.8266, 0.01743\n")
+        out.append(" 29.4699,  0.0191\n")
+        out.append(" 30.0581, 0.02076\n")
+        out.append("  30.595, 0.02243\n")
+        out.append(" 31.1118,  0.0241\n")
+        out.append(" 31.6278, 0.02577\n")
+        out.append(" 32.1097, 0.02743\n")
+        out.append(" 32.5601,  0.0291\n")
+        out.append("  32.963, 0.03077\n")
+        out.append(" 33.3357, 0.03244\n")
+        out.append(" 33.6879,  0.0341\n")
+        out.append(" 34.0127, 0.03577\n")
+        out.append(" 34.3048, 0.03744\n")
+        out.append(" 34.5396, 0.03911\n")
+        out.append(" 34.7653, 0.04078\n")
+        out.append(" 34.9997, 0.04244\n")
+        out.append(" 35.2646, 0.04411\n")
+        out.append(" 35.5295, 0.04578\n")
+        out.append(" 35.7346, 0.04745\n")
+        out.append(" 35.8728, 0.04911\n")
+        out.append(" 35.9606, 0.05078\n")
+        out.append(" 36.0426, 0.05245\n")
+        out.append("  36.154, 0.05412\n")
+        out.append(" 36.3125, 0.05578\n")
+        out.append(" 36.5031, 0.05745\n")
+        out.append(" 36.6572, 0.05912\n")
+        out.append(" 36.7565, 0.06079\n")
+        out.append(" 36.8149, 0.06245\n")
+        out.append("  36.871, 0.06412\n")
+        out.append(" 36.9338, 0.06579\n")
+        out.append(" 36.9963, 0.06746\n")
+        out.append(" 37.0556, 0.06913\n")
+        out.append(" 37.1138, 0.07079\n")
+        out.append(" 37.1474, 0.07246\n")
+        out.append(" 37.1487, 0.07413\n")
+        out.append(" 37.1594, 0.07913\n")
+        out.append(" 37.1812,  0.0808\n")
+        out.append("   37.19, 0.08247\n")
+        out.append("  37.228, 0.08413\n")
+        out.append(" 37.2887,  0.0858\n")
+        out.append(" 37.3111, 0.08747\n")
+        out.append(" 37.3194, 0.09414\n")
+        out.append(" 37.3699, 0.09581\n")
+        out.append(" 37.3718, 0.09748\n")
+        out.append("    37.4,   0.192\n")
+
+        # --- PHASE-PS ---
+        out.append(f"*Material, name={name_phase_b}\n")
+        out.append("*Density\n")
+        out.append(" 1.07e-09,\n")
+        out.append("*Elastic\n")
+        out.append(" 3052.15, 0.35\n")
+        out.append("*Plastic\n")
+        out.append(" 27.4693,      0.\n")
+        out.append(" 27.9405, 0.00021\n")
+        out.append(" 28.4206, 0.00037\n")
+        out.append(" 28.9356, 0.00052\n")
+        out.append(" 29.4288, 0.00068\n")
+        out.append(" 29.8757, 0.00084\n")
+        out.append(" 30.2796,   0.001\n")
+        out.append(" 30.7302, 0.00116\n")
+        out.append(" 31.1788, 0.00132\n")
+        out.append("  31.672, 0.00148\n")
+        out.append(" 32.1399, 0.00163\n")
+        out.append(" 32.5806, 0.00179\n")
+        out.append(" 32.9872, 0.00195\n")
+        out.append(" 33.4584, 0.00211\n")
+        out.append(" 33.9022, 0.00227\n")
+        out.append(" 34.3363, 0.00243\n")
+        out.append(" 34.7803, 0.00259\n")
+        out.append("   35.24, 0.00275\n")
+        out.append(" 35.6833,  0.0029\n")
+        out.append(" 36.0864, 0.00306\n")
+        out.append(" 36.4796, 0.00322\n")
+        out.append(" 36.9157, 0.00338\n")
+        out.append(" 37.3646, 0.00354\n")
+        out.append(" 37.7913,  0.0037\n")
+        out.append(" 38.2252, 0.00386\n")
+        out.append(" 38.6565, 0.00402\n")
+        out.append(" 39.1148, 0.00417\n")
+        out.append(" 39.5492, 0.00433\n")
+        out.append(" 39.9772, 0.00449\n")
+        out.append(" 40.3484, 0.00465\n")
+        out.append(" 40.7091, 0.00481\n")
+        out.append(" 41.0138, 0.00497\n")
+        out.append(" 41.3126, 0.00513\n")
+        out.append(" 41.6081, 0.00529\n")
+        out.append(" 41.8924, 0.00544\n")
+        out.append(" 42.1795,  0.0056\n")
+        out.append(" 42.3882, 0.00576\n")
+        out.append("  42.538, 0.00592\n")
+        out.append("  42.633, 0.00608\n")
+        out.append("  42.719, 0.00624\n")
+        out.append(" 42.8031,  0.0064\n")
+        out.append(" 42.8246, 0.00656\n")
+        out.append(" 42.8554, 0.00671\n")
+        out.append(" 42.8479, 0.00687\n")
+        out.append(" 42.8541, 0.00703\n")
+        out.append(" 42.8628, 0.00719\n")
+        out.append(" 42.9143, 0.00735\n")
+        out.append(" 42.9696, 0.00751\n")
+        out.append(" 42.9911, 0.00767\n")
+        out.append(" 43.0041, 0.00783\n")
+        out.append("    43.1,   0.011\n")
+        out.append("** --- end materials ---\n")
 
     # --- boundary conditions ---
     if load_case == "Tensile-X":
@@ -753,11 +866,37 @@ def postprocess_inp(
     else:
         raise ValueError(f"Unsupported load_case: {load_case}")
 
+    # --- interactions ---
+    if tie_constraint:
+        # --- tie surfaces
+        # stiffer matrix = master / assumes PP-PS nomenclature for phases A-B
+        out.append("*Tie, name=TIE, adjust=NO\n")
+        out.append(f"PART-1.{name_phase_b}-IF, PART-1.{name_phase_a}-IF\n")
+    else:
+        out.append("** --- interaction properties ---\n")
+        out.append("*Surface Interaction, name=IntProp-1\n")
+        out.append("1.,\n")
+        out.append("*Cohesive Behavior\n")
+        out.append("1.25e+08, 1.25e+08, 1.25e+08\n")
+        out.append("*Damage Initiation, criterion=MAXS\n")
+        out.append("32.12, 32.12, 32.12\n")
+        out.append("*Damage Evolution, type=ENERGY\n")
+        out.append("0.04,\n")
+        out.append("** --- interactions ---\n")
+        out.append("** Interaction: Int-1\n")
+        out.append("*Contact Pair, interaction=IntProp-1, small sliding\n")
+        out.append(f"PART-1.{name_phase_b}-IF, PART-1.{name_phase_a}-IF\n")
+
     # --- stepping ---
     out.append("** --- step & output ---\n")
-    out.append(f"*STEP, name={load_case}, nlgeom=YES, inc=10000\n")
-    out.append("*Static\n")
-    out.append("0.1, 1., 1e-08, 0.1\n")
+    if static_solver:
+        out.append(f"*STEP, name={load_case}, nlgeom=YES, inc=10000\n")
+        out.append("*Static\n")
+        out.append("0.1, 1., 1e-08, 0.1\n")
+    else:
+        out.append(f"*STEP, name={load_case}, nlgeom=YES, inc=1000000\n")
+        out.append(f"*Dynamic,application=QUASI-STATIC,initial=NO\n")
+        out.append(f"0.01,1.,1e-05\n")
     out.append("*Boundary\n")
     out.append("PMIN, 1, 3, 0.0\n")
     for rp, dof, val in bc:
