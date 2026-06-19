@@ -614,12 +614,24 @@ def postprocess_inp(
     out.extend(_format_nset("ZMIN", side_nodes_all["ZMIN"]))
     out.extend(_format_nset("ZMAX", side_nodes_all["ZMAX"]))
 
+    # --- macro reference nodes for periodic boundary conditions ---
+    # RP-X stores the displacement jump across XMAX-XMIN.
+    # RP-Y stores the displacement jump across YMAX-YMIN.
+    # RP-Z stores the displacement jump across ZMAX-ZMIN.
+    out.append("*Node\n")
+    out.append(f"9000001, {xmax + 0.1 * Lx}, {ymin}, {zmin}\n")
+    out.append(f"9000002, {xmax + 0.1 * Lx}, {ymax}, {zmin}\n")
+    out.append(f"9000003, {xmax + 0.1 * Lx}, {ymin}, {zmax}\n")
+    out.append("*Nset, nset=RP-X\n9000001,\n")
+    out.append("*Nset, nset=RP-Y\n9000002,\n")
+    out.append("*Nset, nset=RP-Z\n9000003,\n")
+
     for phase_, nodes_, nids_if_ in zip([name_phase_b, name_phase_a], [nodes_b, nodes_a], [nids_b_iface, nids_a_iface]):
         side_nodes = {k: [] for k in side_names}
 
         for n, (x, y, z) in nodes_.items():
-            if n in nids_if_:
-                continue
+            # if n in nids_if_:
+            #     continue
             if abs(x - xmin) < tol:
                 side_nodes["XMIN"].append(n)
             if abs(x - xmax) < tol:
@@ -638,23 +650,24 @@ def postprocess_inp(
 
         bnd = _classify_boundary_nodes(side_nodes)
 
-        P_XMIN, M_XMAX = _pair_coords(nodes_, bnd["faces"]["F_XMIN"], bnd["faces"]["F_XMAX"], "X")
+        P_XMAX, M_XMIN = _pair_coords(nodes_, bnd["faces"]["F_XMAX"], bnd["faces"]["F_XMIN"], "X")
         P_YMAX, M_YMIN = _pair_coords(nodes_, bnd["faces"]["F_YMAX"], bnd["faces"]["F_YMIN"], "Y")
         P_ZMAX, M_ZMIN = _pair_coords(nodes_, bnd["faces"]["F_ZMAX"], bnd["faces"]["F_ZMIN"], "Z")
         faces = [
-            ('13', P_YMAX, M_YMIN),
-            ('23', P_XMIN, M_XMAX),
-            ('12', P_ZMAX, M_ZMIN),
+            ("RP-X", "123", P_XMAX, M_XMIN),
+            ("RP-Y", "123", P_YMAX, M_YMIN),
+            ("RP-Z", "123", P_ZMAX, M_ZMIN),
         ]
         for face in faces:
-            dofs, plus_nodes, minus_nodes = face
+            rp_set, dofs, plus_nodes, minus_nodes = face
             for dof in dofs:
                 for n_plus, n_minus in zip(plus_nodes, minus_nodes):
                     add_to_used(n_plus)
                     add_to_used(n_minus)
-                    out.append(f"*Equation\n2\n")
+                    out.append("*Equation\n3\n")
                     out.append(f"NS-{n_plus}, {dof},  1.0\n")
                     out.append(f"NS-{n_minus}, {dof}, -1.0\n")
+                    out.append(f"{rp_set}, {dof}, -1.0\n")
 
         P_XMAX_ZMAX1, M_XMIN_ZMAX1 = _pair_coords(nodes_, bnd["edges"]["E_XMAX_ZMAX"], bnd["edges"]["E_XMIN_ZMAX"], "X")
         P_XMAX_ZMIN2, M_XMIN_ZMIN2 = _pair_coords(nodes_, bnd["edges"]["E_XMAX_ZMIN"], bnd["edges"]["E_XMIN_ZMIN"], "X")
@@ -667,53 +680,67 @@ def postprocess_inp(
         P_XMIN_YMAX9, M_XMIN_YMIN9 = _pair_coords(nodes_, bnd["edges"]["E_XMIN_YMAX"], bnd["edges"]["E_XMIN_YMIN"], "Y")
 
         edges = [
-            ('2', P_XMAX_ZMAX1, M_XMIN_ZMAX1),
-            ('2', P_XMAX_ZMIN2, M_XMIN_ZMIN2),
-            ('2', P_XMIN_ZMAX3, M_XMIN_ZMIN3),
-            ('1', P_YMAX_ZMAX4, M_YMAX_ZMIN4),
-            ('1', P_YMIN_ZMAX5, M_YMIN_ZMIN5),
-            ('1', P_YMAX_ZMIN6, M_YMIN_ZMIN6),
-            ('3', P_XMAX_YMAX7, M_XMIN_YMAX7),
-            ('3', P_XMAX_YMIN8, M_XMIN_YMIN8),
-            ('3', P_XMIN_YMAX9, M_XMIN_YMIN9),
+            ("RP-X", '2', P_XMAX_ZMAX1, M_XMIN_ZMAX1),
+            ("RP-X", '2', P_XMAX_ZMIN2, M_XMIN_ZMIN2),
+            ("RP-Z", '2', P_XMIN_ZMAX3, M_XMIN_ZMIN3),
+            ("RP-Z", '1', P_YMAX_ZMAX4, M_YMAX_ZMIN4),
+            ("RP-Z", '1', P_YMIN_ZMAX5, M_YMIN_ZMIN5),
+            ("RP-Y", '1', P_YMAX_ZMIN6, M_YMIN_ZMIN6),
+            ("RP-X", '3', P_XMAX_YMAX7, M_XMIN_YMAX7),
+            ("RP-X", '3', P_XMAX_YMIN8, M_XMIN_YMIN8),
+            ("RP-Y", '3', P_XMIN_YMAX9, M_XMIN_YMIN9),
         ]
         for edge in edges:
-            dofs, plus_nodes, minus_nodes = edge
+            rp_set, dofs, plus_nodes, minus_nodes = edge
             for dof in dofs:
                 for n_plus, n_minus in zip(plus_nodes, minus_nodes):
                     add_to_used(n_plus)
                     add_to_used(n_minus)
-                    out.append(f"*Equation\n2\n")
+                    out.append("*Equation\n3\n")
                     out.append(f"NS-{n_plus}, {dof},  1.0\n")
                     out.append(f"NS-{n_minus}, {dof}, -1.0\n")
+                    out.append(f"{rp_set}, {dof}, -1.0\n")
 
-    if load_case == "Tensile-X":
-        couple_dofs = [2, 3]  # tie Y & Z to PMIN/PMAX
-    elif load_case == "Tensile-Y":
-        couple_dofs = [1, 3]  # tie X & Z to PMIN/PMAX
-    elif load_case == "Tensile-Z":
-        couple_dofs = [1, 2]  # tie X & Y to PMIN/PMAX
-    else:
-        couple_dofs = []
 
-    def couple_face_to_corner(face_key, corner_set, dof):
-        for nid_ in side_nodes_all[face_key]:
-            add_to_used(nid_)
-            out.append("*Equation\n2\n")
-            out.append(f"NS-{nid_}, {dof},  1.0\n")
-            out.append(f"{corner_set}, {dof}, -1.0\n")
+    # if load_case == "Tensile-X":
+    #     couple_dofs = [2, 3]  # tie Y & Z to PMIN/PMAX
+    # elif load_case == "Tensile-Y":
+    #     couple_dofs = [1, 3]  # tie X & Z to PMIN/PMAX
+    # elif load_case == "Tensile-Z":
+    #     couple_dofs = [1, 2]  # tie X & Y to PMIN/PMAX
+    # else:
+    #     couple_dofs = []
+    #
+    # def couple_face_to_corner(face_key, corner_set, dof):
+    #     for nid_ in side_nodes_all[face_key]:
+    #         add_to_used(nid_)
+    #         out.append("*Equation\n2\n")
+    #         out.append(f"NS-{nid_}, {dof},  1.0\n")
+    #         out.append(f"{corner_set}, {dof}, -1.0\n")
 
-    if 1 in couple_dofs:
-        couple_face_to_corner("XMAX", "PMAX", 1)
-        couple_face_to_corner("XMIN", "PMIN", 1)
+    # if 1 in couple_dofs:
+    #     couple_face_to_corner("XMAX", "PMAX", 1)
+    #     couple_face_to_corner("XMIN", "PMIN", 1)
+    #
+    # if 2 in couple_dofs:
+    #     couple_face_to_corner("YMAX", "PMAX", 2)
+    #     couple_face_to_corner("YMIN", "PMIN", 2)
+    #
+    # if 3 in couple_dofs:
+    #     couple_face_to_corner("ZMAX", "PMAX", 3)
+    #     couple_face_to_corner("ZMIN", "PMIN", 3)
+    # Do not prescribe transverse strain.
+    # Let transverse contraction emerge from the periodic constraints/material response.
 
-    if 2 in couple_dofs:
-        couple_face_to_corner("YMAX", "PMAX", 2)
-        couple_face_to_corner("YMIN", "PMIN", 2)
-
-    if 3 in couple_dofs:
-        couple_face_to_corner("ZMAX", "PMAX", 3)
-        couple_face_to_corner("ZMIN", "PMIN", 3)
+    # Relate the opposite diagonal corner to the macro RP jumps.
+    # This keeps the macro deformation mode tied to the RVE while PMIN removes rigid translation.
+    for dof in (1, 2, 3):
+        out.append("*Equation\n5\n")
+        out.append(f"PMAX, {dof},  1.0\n")
+        out.append(f"PMIN, {dof}, -1.0\n")
+        out.append(f"RP-X, {dof}, -1.0\n")
+        out.append(f"RP-Y, {dof}, -1.0\n")
+        out.append(f"RP-Z, {dof}, -1.0\n")
 
     out.append("*End Assembly\n\n")
 
@@ -734,7 +761,7 @@ def postprocess_inp(
     else:
         # --- PHASE-PP ---
         out.append("** --- materials ---\n")
-        out.append(f"*Material, name={name_phase_a}\n")
+        out.append(f"*Material, name=PHASE-PP\n")
         out.append("*Density\n")
         out.append("9.5e-10,\n")
         out.append("*Elastic\n")
@@ -797,7 +824,7 @@ def postprocess_inp(
         out.append("    37.4,   0.192\n")
 
         # --- PHASE-PS ---
-        out.append(f"*Material, name={name_phase_b}\n")
+        out.append(f"*Material, name=PHASE-PS\n")
         out.append("*Density\n")
         out.append(" 1.07e-09,\n")
         out.append("*Elastic\n")
@@ -857,14 +884,17 @@ def postprocess_inp(
         out.append("** --- end materials ---\n")
 
     # --- boundary conditions ---
+    # Prescribe the loading macro jump at the RP.
+    # The transverse normal RP components are intentionally left free.
     if load_case == "Tensile-X":
-        bc = [("XMIN", 1, 0.0), ("XMAX", 1, strain * Lx)]
+        bc = [("RP-X", 1, strain * Lx)]
     elif load_case == "Tensile-Y":
-        bc = [("YMIN", 2, 0.0), ("YMAX", 2, strain * Ly)]
+        bc = [("RP-Y", 2, strain * Ly)]
     elif load_case == "Tensile-Z":
-        bc = [("ZMIN", 3, 0.0), ("ZMAX", 3, strain * Lz)]
+        bc = [("RP-Z", 3, strain * Lz)]
     else:
         raise ValueError(f"Unsupported load_case: {load_case}")
+
 
     # --- interactions ---
     if tie_constraint:
@@ -882,6 +912,8 @@ def postprocess_inp(
         out.append("32.12, 32.12, 32.12\n")
         out.append("*Damage Evolution, type=ENERGY\n")
         out.append("0.04,\n")
+        # out.append("*Damage Stabilization\n")
+        # out.append("1e.05,\n")
         out.append("** --- interactions ---\n")
         out.append("** Interaction: Int-1\n")
         out.append("*Contact Pair, interaction=IntProp-1, small sliding\n")
@@ -892,32 +924,49 @@ def postprocess_inp(
     if static_solver:
         out.append(f"*STEP, name={load_case}, nlgeom=YES, inc=10000\n")
         out.append("*Static\n")
-        out.append("0.1, 1., 1e-08, 0.1\n")
+        out.append("0.01, 1., 1e-08, 0.1\n")
     else:
         out.append(f"*STEP, name={load_case}, nlgeom=YES, inc=1000000\n")
         out.append(f"*Dynamic,application=QUASI-STATIC,initial=NO\n")
-        out.append(f"0.01,1.,1e-05\n")
+        out.append(f"1e-03,1.,1e-06\n")
+
     out.append("*Boundary\n")
+    # Rigid-body translation anchor. This is a single corner set, not a face constraint.
     out.append("PMIN, 1, 3, 0.0\n")
+
+    # Suppress macro shear components; leave transverse normal components free.
+    out.append("RP-X, 2, 3, 0.0\n")
+    out.append("RP-Y, 1, 1, 0.0\n")
+    out.append("RP-Y, 3, 3, 0.0\n")
+    out.append("RP-Z, 1, 2, 0.0\n")
+
     for rp, dof, val in bc:
         out.append(f"{rp}, {dof}, {dof}, {val}\n")
 
-    # --- FIELD OUTPUT ---
+
+    # --- OUTPUT ---
+    out.append("**\n")
+    out.append("**OUTPUT REQUESTS\n")
+    out.append("**\n")
     out.append("*Restart, write, frequency=0\n")
-    out.append("*Output, field, time interval=0.1, time marks=NO\n")
+    out.append("**\n")
+    out.append("**FIELD OUTPUT: F-Output-1\n")
+    out.append("**\n")
+    out.append("*Output, field\n")
     out.append("*Node Output\n")
     out.append("U\n")
     out.append("*Element Output, directions=YES\n")
-    out.append("S, LE, PE, PEEQ, STATUS, EVOL\n")
+    out.append("EVOL, LE, PE, PEEQ, S, STATUS\n")
     out.append("*Contact Output\n")
-    out.append("CSTRESS, CDISP, CSTATUS\n")
-
-    # --- HISTORY OUTPUT ---
+    out.append("CDISP, CSTATUS, CSTRESS\n")
+    out.append("**\n")
+    out.append("**HISTORY OUTPUT: H-Output-1\n")
+    out.append("**\n")
     out.append("*Output, history, frequency=1\n")
     out.append("*Energy Output\n")
-    out.append("ALLIE, ALLSE, ALLWK, ALLPD, ALLDMD, ALLCD, ETOTAL\n")
-    out.append("*Node Output, nset=PMAX\n")
-    out.append("U, RF\n")
+    out.append("ALLCD, ALLDMD, ALLIE, ALLPD, ALLSE, ALLWK, ETOTAL\n")
+    out.append("**\n")
+    out.append("*End Step\n")
     out.append("** --- end step & output ---\n")
 
     Path(out_path).write_text("".join(out), encoding="utf-8")

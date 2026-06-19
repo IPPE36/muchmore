@@ -70,11 +70,16 @@ def _import_and_get_new_volume_tags(path: str) -> list[int]:
 
 
 def stl_to_step(stl_path: str, a_path: str, b_path: str, nx: int, ny: int, nz: int):
-    subprocess.run(
-        [FREECAD_PYTHON, FREECAD_WORKER, stl_path, a_path, b_path, str(nx), str(ny), str(nz)],
+    result = subprocess.run(
+        [FREECAD_PYTHON, FREECAD_WORKER, stl_path, a_path, b_path,
+         str(nx), str(ny), str(nz)],
         text=True,
         capture_output=True
     )
+    if result.returncode != 0:
+        print(result.stdout)
+        print(result.stderr)
+        raise RuntimeError("FreeCAD STEP conversion failed")
 
 
 def _clean_pv(poly: pv.PolyData, tol: float = 1e-6) -> pv.PolyData:
@@ -193,7 +198,13 @@ def mesh_3d(
     gmsh.option.setNumber("General.Verbosity", 0)
 
     with timer("MARSHING CUBES"):
-        parts = periodic_iso_surfaces(field, step_size=nx//32)
+        parts = periodic_iso_surfaces(field, step_size=max(1, nx // 32))
+
+        # keep only the dominant connected component
+        # parts = sorted(parts, key=lambda p: float(p.area), reverse=True)
+        # parts = [parts[0]]
+        # print("using connected parts:", len(parts), "area:", parts[0].area)
+
         shift = np.array([nx, ny, nz], dtype=float)
         parts = [_clean_pv(p.translate(-shift, inplace=False)) for p in parts]
         merged = pv.merge(parts)
